@@ -70,8 +70,55 @@ def run_phase(phase: str, data_dir: str, output_dir: str):
         print("Feature engineering complete.")
         
     elif phase == "retrieval":
-        print("Running Retrieval...")
-        print("Retrieval complete.")
+        print("Running Retrieval (Phases 5-8)...")
+        # Load queries (S1)
+        s1_path = os.path.join(output_dir, 'feat_train_source1.tsv')
+        if not os.path.exists(s1_path):
+            print(f"Skipping retrieval, query file not found at {s1_path}. Did you run --phase features?")
+            return
+            
+        print("Loading queries (S1) and corpus (S2/S3)...")
+        df_s1 = pd.read_csv(s1_path, sep='\t', dtype=str).head(500) # testing on 500 rows for speed
+        
+        # Load and combine corpus (S2 + S3)
+        df_s2 = pd.read_csv(os.path.join(output_dir, 'feat_train_source2.tsv'), sep='\t', dtype=str)
+        df_s3 = pd.read_csv(os.path.join(output_dir, 'feat_train_source3.tsv'), sep='\t', dtype=str)
+        df_corpus = pd.concat([df_s2, df_s3], ignore_index=True)
+        
+        print("Creating Multi-View Representations...")
+        df_s1 = create_views(df_s1)
+        df_corpus = create_views(df_corpus)
+        
+        candidate_dfs = []
+        
+        print("Building TF-IDF Retriever for Name View...")
+        retriever_name = SparseRetriever(method='tfidf')
+        retriever_name.fit(df_corpus, id_col='entity_id', text_col='name_view')
+        
+        print("Retrieving candidates based on Name View...")
+        res_name = batch_retrieve(df_s1, retriever_name, 'entity_id', 'name_view', 'name_view', k=20)
+        if not res_name.empty:
+            candidate_dfs.append(res_name)
+            
+        print("Building TF-IDF Retriever for Address View...")
+        retriever_addr = SparseRetriever(method='tfidf')
+        retriever_addr.fit(df_corpus, id_col='entity_id', text_col='address_view')
+        
+        print("Retrieving candidates based on Address View...")
+        res_addr = batch_retrieve(df_s1, retriever_addr, 'entity_id', 'address_view', 'address_view', k=20)
+        if not res_addr.empty:
+            candidate_dfs.append(res_addr)
+            
+        print("Fusing candidates with Reciprocal Rank Fusion (RRF)...")
+        if candidate_dfs:
+            fused_candidates = reciprocal_rank_fusion(candidate_dfs)
+            out_path = os.path.join(output_dir, "fused_candidates.tsv")
+            print(f"Saving {len(fused_candidates)} fused candidates to {out_path}...")
+            fused_candidates.to_csv(out_path, sep='\t', index=False)
+        else:
+            print("No candidates retrieved.")
+            
+        print("Retrieval complete (Testing limit applied).")
         
     elif phase == "evidence":
         print("Running Evidence Engine...")

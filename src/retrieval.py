@@ -112,7 +112,8 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever: SparseRetriever, q_id_co
                 "rank": c['rank'],
                 "score": c['score']
             })
-            return pd.DataFrame(all_results)
+    
+    return pd.DataFrame(all_results)
             
 class DenseRetriever:
     """
