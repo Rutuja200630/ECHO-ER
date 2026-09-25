@@ -31,7 +31,7 @@ def compute_recall(res_df, gt_map, k_list=[5, 10, 20, 50, 100]):
         return {k: recall_at_k[k] / total_queries for k in k_list}
     return {k: 0.0 for k in k_list}
 
-def run_retrieval(retriever_class, df_corpus, df_s1, name, k=100, batch_size=5000, corpus_chunk_size=100000):
+def run_retrieval(retriever_class, df_corpus, df_s1, name, k=100, **kwargs):
     print(f"\n--- Running {name} ---")
     tracemalloc.start()
     t0 = time.time()
@@ -41,10 +41,7 @@ def run_retrieval(retriever_class, df_corpus, df_s1, name, k=100, batch_size=500
     t_fit = time.time() - t0
     
     t1 = time.time()
-    if retriever_class == SparseRetriever:
-        res = batch_retrieve(df_s1, retriever, 'entity_id', 'name_view', 'name_view', k=k, batch_size=batch_size, corpus_chunk_size=corpus_chunk_size)
-    else:
-        res = batch_retrieve(df_s1, retriever, 'entity_id', 'name_view', 'name_view', k=k)
+    res = batch_retrieve(df_s1, retriever, 'entity_id', 'name_view', 'name_view', k=k, **kwargs)
     t_ret = time.time() - t1
     
     current_mem, peak_mem = tracemalloc.get_traced_memory()
@@ -73,15 +70,16 @@ def benchmark_correctness(data_dir):
     df_s1 = create_views(df_s1)
     df_corpus = create_views(df_corpus)
     
-    res_old, _ = run_retrieval(OldSparseRetriever, df_corpus, df_s1, "OLD RETRIEVER", k=100)
-    res_new, _ = run_retrieval(SparseRetriever, df_corpus, df_s1, "NEW OPTIMIZED RETRIEVER", k=100, batch_size=1000, corpus_chunk_size=5000)
+    # Use 100 for exact K
+    from retrieval import SparseRetriever, InvertedIndexRetriever, OldSparseRetriever
+    res_old, _ = run_retrieval(SparseRetriever, df_corpus, df_s1, "FULL SPARSE MATRIX", k=100, batch_size=5000, corpus_chunk_size=10000)
+    res_new, _ = run_retrieval(InvertedIndexRetriever, df_corpus, df_s1, "INVERTED INDEX", k=100)
     
     print("\nComparing Results...")
     res_old_grp = res_old.groupby('s1_id')
     res_new_grp = res_new.groupby('s1_id')
     
     overlaps = {1: 0, 5: 0, 10: 0, 20: 0, 50: 0, 100: 0}
-    max_score_diff = 0.0
     count = 0
     
     for q_id in df_s1['entity_id']:
@@ -97,15 +95,6 @@ def benchmark_correctness(data_dir):
         
         for k in overlaps.keys():
             overlaps[k] += len(set(old_ids[:k]).intersection(set(new_ids[:k]))) / k
-            
-        # Score difference
-        old_scores = dict(zip(old_cands['s2_id'], old_cands['score']))
-        new_scores = dict(zip(new_cands['s2_id'], new_cands['score']))
-        for c_id, old_s in old_scores.items():
-            if c_id in new_scores:
-                diff = abs(old_s - new_scores[c_id])
-                if diff > max_score_diff:
-                    max_score_diff = diff
                     
     print(f"Top-1 Agreement: {overlaps[1]/count:.4f}")
     print(f"Top-5 Overlap: {overlaps[5]/count:.4f}")
@@ -113,10 +102,9 @@ def benchmark_correctness(data_dir):
     print(f"Top-20 Overlap: {overlaps[20]/count:.4f}")
     print(f"Top-50 Overlap: {overlaps[50]/count:.4f}")
     print(f"Top-100 Overlap: {overlaps[100]/count:.4f}")
-    print(f"Max Score Difference: {max_score_diff:.8e}")
 
 def benchmark_scaling(data_dir, n_queries, n_corpus, gt_map, chunk_size=500000):
-    print(f"\n=== BENCHMARK (Queries={n_queries}, Corpus={n_corpus}, ChunkSize={chunk_size}) ===")
+    print(f"\n=== BENCHMARK (Queries={n_queries}, Corpus={n_corpus}) ===")
     df_s1 = pd.read_csv(os.path.join(data_dir, "train_source1.tsv"), sep="\t", dtype=str, nrows=n_queries)
     df_s2 = pd.read_csv(os.path.join(data_dir, "train_source2.tsv"), sep="\t", dtype=str, nrows=n_corpus)
     df_corpus = pd.concat([df_s2], ignore_index=True)
@@ -130,12 +118,26 @@ def benchmark_scaling(data_dir, n_queries, n_corpus, gt_map, chunk_size=500000):
     df_s1 = create_views(df_s1)
     df_corpus = create_views(df_corpus)
     
-    res, stats = run_retrieval(SparseRetriever, df_corpus, df_s1, "OPTIMIZED RETRIEVER", k=100, batch_size=5000, corpus_chunk_size=chunk_size)
+    from retrieval import SparseRetriever, InvertedIndexRetriever
     
-    print("Calculating Recall@K...")
-    recall = compute_recall(res, gt_map)
-    for k, v in recall.items():
+    res_full, stats_full = run_retrieval(SparseRetriever, df_corpus, df_s1, "FULL SPARSE MATRIX", k=100, batch_size=5000, corpus_chunk_size=chunk_size)
+    print("Calculating Recall@K (Full Sparse)...")
+    recall_full = compute_recall(res_full, gt_map)
+    for k, v in recall_full.items():
         print(f"Recall@{k}: {v:.4f}")
+        
+    res_inv, stats_inv = run_retrieval(InvertedIndexRetriever, df_corpus, df_s1, "INVERTED INDEX", k=100)
+    print("Calculating Recall@K (Inverted Index)...")
+    recall_inv = compute_recall(res_inv, gt_map)
+    for k, v in recall_inv.items():
+        print(f"Recall@{k}: {v:.4f}")
+        
+    print("\n=== SUMMARY ===")
+    speedup = stats_full['ret_time'] / stats_inv['ret_time'] if stats_inv['ret_time'] > 0 else 0
+    print(f"Retrieval Speedup: {speedup:.2f}x")
+    print(f"Peak RAM Reduction: {stats_full['peak_mb'] - stats_inv['peak_mb']:.2f} MB")
+    print(f"Recall@50 Diff: {recall_inv[50] - recall_full[50]:.4f}")
+    print(f"Recall@100 Diff: {recall_inv[100] - recall_full[100]:.4f}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
