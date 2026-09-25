@@ -1,0 +1,116 @@
+{
+    "S1_Train": {
+        "rows": 2206821,
+        "columns": 4,
+        "column_names": [
+            "entity_id",
+            "business_name",
+            "business_address",
+            "country"
+        ],
+        "missingness": {
+            "entity_id": 0,
+            "business_name": 0,
+            "business_address": 0,
+            "country": 0
+        },
+        "duplicates": 0
+    },
+    "S2_Train": {
+        "rows": 5034616,
+        "columns": 4,
+        "column_names": [
+            "entity_id",
+            "business_name",
+            "business_address",
+            "country"
+        ],
+        "missingness": {
+            "entity_id": 0,
+            "business_name": 2,
+            "business_address": 168967,
+            "country": 0
+        },
+        "duplicates": 0
+    },
+    "S3_Train": {
+        "rows": 5285603,
+        "columns": 4,
+        "column_names": [
+            "entity_id",
+            "business_name",
+            "business_address",
+            "country"
+        ],
+        "missingness": {
+            "entity_id": 0,
+            "business_name": 13,
+            "business_address": 175916,
+            "country": 0
+        },
+        "duplicates": 0
+    },
+    "GT_Train": {
+        "rows": 2206821,
+        "columns": 2,
+        "column_names": [
+            "source1_entity_id",
+            "matched_entity_ids"
+        ],
+        "positive_examples": 2083574,
+        "negative_examples": 123247,
+        "multiple_matches": 1964417,
+        "duplicate_pairs_check": 0
+    },
+    "S1_Test": {
+        "rows": 1732544,
+        "columns": 4,
+        "column_names": [
+            "entity_id",
+            "business_name",
+            "business_address",
+            "country"
+        ],
+        "missingness": {
+            "entity_id": 0,
+            "business_name": 0,
+            "business_address": 0,
+            "country": 0
+        },
+        "duplicates": 0
+    },
+    "S2_Test": {
+        "rows": 4887273,
+        "columns": 4,
+        "column_names": [
+            "entity_id",
+            "business_name",
+            "business_address",
+            "country"
+        ],
+        "missingness": {
+            "entity_id": 0,
+            "business_name": 46,
+            "business_address": 129408,
+            "country": 0
+        },
+        "duplicates": 0
+    },
+    "S3_Test": {
+        "rows": 5082316,
+        "columns": 4,
+        "column_names": [
+            "entity_id",
+            "business_name",
+            "business_address",
+            "country"
+        ],
+        "missingness": {
+            "entity_id": 0,
+            "business_name": 59,
+            "business_address": 136098,
+            "country": 0
+        },
+        "duplicates": 0
+    }
+}

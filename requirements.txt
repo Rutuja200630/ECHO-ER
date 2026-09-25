@@ -1,0 +1,8 @@
+pandas
+numpy
+scikit-learn
+rank_bm25
+lightgbm
+tqdm
+thefuzz
+python-Levenshtein

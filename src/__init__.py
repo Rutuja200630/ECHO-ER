@@ -1,0 +1,3 @@
+"""
+ECHO-ER source package.
+"""
