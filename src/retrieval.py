@@ -74,7 +74,7 @@ class SparseRetriever:
             self.vectorizer = TfidfVectorizer(analyzer='word', stop_words=None, min_df=1)
             self.matrix = self.vectorizer.fit_transform(self.corpus_texts)
 
-def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_col: str, view_name: str, k: int = 20, batch_size: int = 1000) -> pd.DataFrame:
+def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_col: str, view_name: str, k: int = 50, batch_size: int = 5000, corpus_chunk_size: int = 1000000) -> pd.DataFrame:
     all_results = []
     
     if isinstance(retriever, OldSparseRetriever):
@@ -86,52 +86,95 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_co
                 all_results.append({"s1_id": q_id, "s2_id": c['candidate_id'], "view": view_name, "rank": c['rank'], "score": c['score']})
         return pd.DataFrame(all_results)
     
-    # Optimized batch retrieval
+    # Optimized batch retrieval with corpus chunking
     query_texts = queries_df[q_text_col].tolist()
     query_ids = queries_df[q_id_col].tolist()
+    num_queries = len(query_texts)
+    num_corpus = retriever.matrix.shape[0]
     
-    # Process in batches to limit memory usage
-    for start_idx in range(0, len(query_texts), batch_size):
-        end_idx = min(start_idx + batch_size, len(query_texts))
-        batch_texts = query_texts[start_idx:end_idx]
-        batch_ids = query_ids[start_idx:end_idx]
+    for start_q in range(0, num_queries, batch_size):
+        end_q = min(start_q + batch_size, num_queries)
+        batch_texts = query_texts[start_q:end_q]
+        batch_ids = query_ids[start_q:end_q]
+        curr_batch_size = len(batch_ids)
         
-        # Sparse matrix of query embeddings (BatchSize x VocabSize)
         q_vecs = retriever.vectorizer.transform(batch_texts)
         
-        # Dot product with corpus transpose -> (BatchSize x CorpusSize)
-        scores_mat = q_vecs.dot(retriever.matrix.T)
+        # Maintain global top K per query in this batch
+        global_top_scores = np.full((curr_batch_size, k), -1.0, dtype=np.float32)
+        global_top_indices = np.full((curr_batch_size, k), -1, dtype=np.int32)
         
-        # Iterate over rows in the sparse scores matrix
-        for i in range(scores_mat.shape[0]):
+        for start_c in range(0, num_corpus, corpus_chunk_size):
+            end_c = min(start_c + corpus_chunk_size, num_corpus)
+            
+            # Slice the corpus matrix
+            corpus_chunk_mat = retriever.matrix[start_c:end_c, :]
+            
+            # Sparse dot product
+            scores_mat = q_vecs.dot(corpus_chunk_mat.T)
+            
+            # Extract top K for each query in this chunk
+            for i in range(curr_batch_size):
+                row_start = scores_mat.indptr[i]
+                row_end = scores_mat.indptr[i+1]
+                
+                if row_start == row_end:
+                    continue
+                    
+                row_data = scores_mat.data[row_start:row_end]
+                row_cols = scores_mat.indices[row_start:row_end]
+                
+                num_non_zero = len(row_data)
+                if num_non_zero > k:
+                    top_k_local = np.argpartition(row_data, -k)[-k:]
+                    chunk_scores = row_data[top_k_local]
+                    chunk_indices = row_cols[top_k_local] + start_c # map to global corpus index
+                else:
+                    chunk_scores = row_data
+                    chunk_indices = row_cols + start_c
+                    
+                # Merge with global top K for this query
+                merged_scores = np.concatenate((global_top_scores[i], chunk_scores))
+                merged_indices = np.concatenate((global_top_indices[i], chunk_indices))
+                
+                # Get the new top K from the merged array
+                # Filter out -1 defaults
+                valid_mask = merged_indices != -1
+                if not valid_mask.any():
+                    continue
+                valid_scores = merged_scores[valid_mask]
+                valid_indices = merged_indices[valid_mask]
+                
+                if len(valid_scores) > k:
+                    top_k_merged = np.argpartition(valid_scores, -k)[-k:]
+                    global_top_scores[i] = valid_scores[top_k_merged]
+                    global_top_indices[i] = valid_indices[top_k_merged]
+                else:
+                    global_top_scores[i, :len(valid_scores)] = valid_scores
+                    global_top_indices[i, :len(valid_indices)] = valid_indices
+                    
+        # Format results for this query batch
+        for i in range(curr_batch_size):
             q_id = batch_ids[i]
-            row_start = scores_mat.indptr[i]
-            row_end = scores_mat.indptr[i+1]
+            # Sort the global top K
+            valid_mask = global_top_indices[i] != -1
+            final_scores = global_top_scores[i][valid_mask]
+            final_indices = global_top_indices[i][valid_mask]
             
-            if row_start == row_end:
-                continue # No matches
+            if len(final_scores) > 0:
+                sort_idx = np.argsort(-final_scores)
+                sorted_scores = final_scores[sort_idx]
+                sorted_indices = final_indices[sort_idx]
                 
-            row_data = scores_mat.data[row_start:row_end]
-            row_indices = scores_mat.indices[row_start:row_end]
-            
-            num_non_zero = len(row_data)
-            
-            if num_non_zero > k:
-                # Get indices of top K in row_data
-                top_k_local = np.argpartition(row_data, -k)[-k:]
-                # Sort these top K precisely
-                sorted_local = top_k_local[np.argsort(-row_data[top_k_local])]
-            else:
-                sorted_local = np.argsort(-row_data)
-                
-            rank = 1
-            for local_idx in sorted_local:
-                score = float(row_data[local_idx])
-                if score > 0:
-                    corpus_idx = row_indices[local_idx]
-                    cand_id = retriever.corpus_ids[corpus_idx]
-                    all_results.append({"s1_id": q_id, "s2_id": cand_id, "view": view_name, "rank": rank, "score": score})
-                    rank += 1
+                for rank, (score, c_idx) in enumerate(zip(sorted_scores, sorted_indices), start=1):
+                    cand_id = retriever.corpus_ids[c_idx]
+                    all_results.append({
+                        "s1_id": q_id,
+                        "s2_id": cand_id,
+                        "view": view_name,
+                        "rank": rank,
+                        "score": score
+                    })
                     
     return pd.DataFrame(all_results)
             

@@ -7,7 +7,7 @@ import argparse
 import numpy as np
 from retrieval import OldSparseRetriever, SparseRetriever, batch_retrieve, create_views
 
-def compute_recall(res_df, gt_map, k_list=[5, 10, 20, 50]):
+def compute_recall(res_df, gt_map, k_list=[5, 10, 20, 50, 100]):
     if res_df is None or res_df.empty:
         return {k: 0.0 for k in k_list}
         
@@ -31,7 +31,7 @@ def compute_recall(res_df, gt_map, k_list=[5, 10, 20, 50]):
         return {k: recall_at_k[k] / total_queries for k in k_list}
     return {k: 0.0 for k in k_list}
 
-def run_retrieval(retriever_class, df_corpus, df_s1, name, k=50, batch_size=1000):
+def run_retrieval(retriever_class, df_corpus, df_s1, name, k=100, batch_size=5000, corpus_chunk_size=100000):
     print(f"\n--- Running {name} ---")
     tracemalloc.start()
     t0 = time.time()
@@ -41,7 +41,10 @@ def run_retrieval(retriever_class, df_corpus, df_s1, name, k=50, batch_size=1000
     t_fit = time.time() - t0
     
     t1 = time.time()
-    res = batch_retrieve(df_s1, retriever, 'entity_id', 'name_view', 'name_view', k=k, batch_size=batch_size)
+    if retriever_class == SparseRetriever:
+        res = batch_retrieve(df_s1, retriever, 'entity_id', 'name_view', 'name_view', k=k, batch_size=batch_size, corpus_chunk_size=corpus_chunk_size)
+    else:
+        res = batch_retrieve(df_s1, retriever, 'entity_id', 'name_view', 'name_view', k=k)
     t_ret = time.time() - t1
     
     current_mem, peak_mem = tracemalloc.get_traced_memory()
@@ -70,14 +73,14 @@ def benchmark_correctness(data_dir):
     df_s1 = create_views(df_s1)
     df_corpus = create_views(df_corpus)
     
-    res_old, _ = run_retrieval(OldSparseRetriever, df_corpus, df_s1, "OLD RETRIEVER", k=50)
-    res_new, _ = run_retrieval(SparseRetriever, df_corpus, df_s1, "NEW OPTIMIZED RETRIEVER", k=50)
+    res_old, _ = run_retrieval(OldSparseRetriever, df_corpus, df_s1, "OLD RETRIEVER", k=100)
+    res_new, _ = run_retrieval(SparseRetriever, df_corpus, df_s1, "NEW OPTIMIZED RETRIEVER", k=100, batch_size=1000, corpus_chunk_size=5000)
     
     print("\nComparing Results...")
     res_old_grp = res_old.groupby('s1_id')
     res_new_grp = res_new.groupby('s1_id')
     
-    overlaps = {1: 0, 5: 0, 10: 0, 20: 0, 50: 0}
+    overlaps = {1: 0, 5: 0, 10: 0, 20: 0, 50: 0, 100: 0}
     max_score_diff = 0.0
     count = 0
     
@@ -109,10 +112,11 @@ def benchmark_correctness(data_dir):
     print(f"Top-10 Overlap: {overlaps[10]/count:.4f}")
     print(f"Top-20 Overlap: {overlaps[20]/count:.4f}")
     print(f"Top-50 Overlap: {overlaps[50]/count:.4f}")
+    print(f"Top-100 Overlap: {overlaps[100]/count:.4f}")
     print(f"Max Score Difference: {max_score_diff:.8e}")
 
-def benchmark_scaling(data_dir, n_queries, n_corpus, gt_map):
-    print(f"\n=== BENCHMARK (Queries={n_queries}, Corpus={n_corpus}) ===")
+def benchmark_scaling(data_dir, n_queries, n_corpus, gt_map, chunk_size=500000):
+    print(f"\n=== BENCHMARK (Queries={n_queries}, Corpus={n_corpus}, ChunkSize={chunk_size}) ===")
     df_s1 = pd.read_csv(os.path.join(data_dir, "train_source1.tsv"), sep="\t", dtype=str, nrows=n_queries)
     df_s2 = pd.read_csv(os.path.join(data_dir, "train_source2.tsv"), sep="\t", dtype=str, nrows=n_corpus)
     df_corpus = pd.concat([df_s2], ignore_index=True)
@@ -126,7 +130,7 @@ def benchmark_scaling(data_dir, n_queries, n_corpus, gt_map):
     df_s1 = create_views(df_s1)
     df_corpus = create_views(df_corpus)
     
-    res, stats = run_retrieval(SparseRetriever, df_corpus, df_s1, "OPTIMIZED RETRIEVER", k=50, batch_size=1000)
+    res, stats = run_retrieval(SparseRetriever, df_corpus, df_s1, "OPTIMIZED RETRIEVER", k=100, batch_size=5000, corpus_chunk_size=chunk_size)
     
     print("Calculating Recall@K...")
     recall = compute_recall(res, gt_map)
