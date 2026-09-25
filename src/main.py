@@ -78,12 +78,15 @@ def run_phase(phase: str, data_dir: str, output_dir: str):
             return
             
         print("Loading queries (S1) and corpus (S2/S3)...")
-        df_s1 = pd.read_csv(s1_path, sep='\t', dtype=str).head(500) # testing on 500 rows for speed
+        df_s1 = pd.read_csv(s1_path, sep='\t', dtype=str)
         
         # Load and combine corpus (S2 + S3)
         df_s2 = pd.read_csv(os.path.join(output_dir, 'feat_train_source2.tsv'), sep='\t', dtype=str)
         df_s3 = pd.read_csv(os.path.join(output_dir, 'feat_train_source3.tsv'), sep='\t', dtype=str)
         df_corpus = pd.concat([df_s2, df_s3], ignore_index=True)
+        
+        print(f"Total S1 Queries: {len(df_s1)}")
+        print(f"Total S2/S3 Corpus: {len(df_corpus)}")
         
         print("Creating Multi-View Representations...")
         df_s1 = create_views(df_s1)
@@ -96,7 +99,7 @@ def run_phase(phase: str, data_dir: str, output_dir: str):
         retriever_name.fit(df_corpus, id_col='entity_id', text_col='name_view')
         
         print("Retrieving candidates based on Name View...")
-        res_name = batch_retrieve(df_s1, retriever_name, 'entity_id', 'name_view', 'name_view', k=20)
+        res_name = batch_retrieve(df_s1, retriever_name, 'entity_id', 'name_view', 'name_view', k=20, batch_size=5000)
         if not res_name.empty:
             candidate_dfs.append(res_name)
             
@@ -105,7 +108,7 @@ def run_phase(phase: str, data_dir: str, output_dir: str):
         retriever_addr.fit(df_corpus, id_col='entity_id', text_col='address_view')
         
         print("Retrieving candidates based on Address View...")
-        res_addr = batch_retrieve(df_s1, retriever_addr, 'entity_id', 'address_view', 'address_view', k=20)
+        res_addr = batch_retrieve(df_s1, retriever_addr, 'entity_id', 'address_view', 'address_view', k=20, batch_size=5000)
         if not res_addr.empty:
             candidate_dfs.append(res_addr)
             
