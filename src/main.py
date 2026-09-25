@@ -23,7 +23,22 @@ def run_phase(phase: str, data_dir: str, output_dir: str):
         
     elif phase == "preprocess":
         print("Running Preprocessing...")
-        # df = normalize_dataframe(df)
+        for source in ['train_source1.tsv', 'train_source2.tsv', 'train_source3.tsv']:
+            path = os.path.join(data_dir, source)
+            if not os.path.exists(path):
+                print(f"Skipping {source}, file not found at {path}")
+                continue
+            
+            print(f"Loading {source}...")
+            df = pd.read_csv(path, sep='\t', dtype=str)
+            
+            print(f"Normalizing {source}...")
+            df_norm = normalize_dataframe(df)
+            
+            out_path = os.path.join(output_dir, f"norm_{source}")
+            print(f"Saving to {out_path}...")
+            df_norm.to_csv(out_path, sep='\t', index=False)
+            
         print("Preprocessing complete.")
         
     elif phase == "features":
