@@ -72,9 +72,17 @@ def process_chunk(chunk_data):
 # MAIN KAGGLE EXECUTION (MAX CPU UTILIZATION)
 # ---------------------------------------------------------
 def run_kaggle_phase1():
-    # Adjust paths for Kaggle environment (usually /kaggle/input/... and /kaggle/working/...)
-    # Replace these paths when running in the Kaggle notebook
-    base_dir = "/kaggle/input/your-dataset-name/train" 
+    import glob
+    
+    # Auto-detect Kaggle input directory
+    possible_paths = glob.glob("/kaggle/input/**/train_source1.tsv", recursive=True)
+    if not possible_paths:
+        print("❌ Error: Could not find train_source1.tsv anywhere in /kaggle/input/. Did you attach the dataset to the notebook?")
+        return
+        
+    base_dir = os.path.dirname(possible_paths[0])
+    print(f"📁 Auto-detected dataset path: {base_dir}")
+    
     out_dir = "/kaggle/working/data/processed/train"
     
     os.makedirs(out_dir, exist_ok=True)
