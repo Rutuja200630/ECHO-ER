@@ -124,6 +124,28 @@ class MaskedSparseRetriever:
             # Convert to a flat dense array for fast lookup
             self.doc_freq = np.array(self.matrix.astype(bool).sum(axis=0)).flatten()
 
+class CuPySparseRetriever:
+    """
+    Sublinear retrieval using Kaggle's GPU via CuPy.
+    Moves the TF-IDF matrices to VRAM and performs blistering fast sparse matrix multiplication.
+    """
+    def __init__(self, method: str = 'tfidf'):
+        self.method = method
+        self.vectorizer = None
+        self.corpus_ids = []
+        self.corpus_texts = []
+        self.matrix = None
+        
+    def fit(self, df_corpus: pd.DataFrame, id_col: str, text_col: str):
+        self.corpus_ids = df_corpus[id_col].tolist()
+        self.corpus_texts = df_corpus[text_col].tolist()
+        if self.method == 'tfidf':
+            self.vectorizer = TfidfVectorizer(analyzer='word', stop_words=None, min_df=1, dtype=np.float32)
+            self.matrix = self.vectorizer.fit_transform(self.corpus_texts)
+            
+            # Optional: eagerly move to GPU if you want, but better to do it during retrieve
+            # so we can handle memory cleanly.
+
 def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_col: str, view_name: str, k: int = 50, batch_size: int = 5000, corpus_chunk_size: int = 1000000) -> pd.DataFrame:
     all_results = []
     
@@ -312,6 +334,97 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_co
             import gc
             gc.collect()
                         
+        return pd.DataFrame(all_results)
+        
+    if isinstance(retriever, CuPySparseRetriever):
+        query_texts = queries_df[q_text_col].tolist()
+        query_ids = queries_df[q_id_col].tolist()
+        num_queries = len(query_texts)
+        import time
+        from tqdm import tqdm
+        
+        try:
+            import cupy as cp
+            import cupyx.scipy.sparse as cpx_sparse
+        except ImportError:
+            raise ImportError("CuPy is required for CuPySparseRetriever. Install it or use MaskedSparseRetriever.")
+            
+        print(f"Starting GPU (CuPy) batched retrieval ({num_queries} queries, batch size: {batch_size})", flush=True)
+        
+        # Move Corpus matrix to GPU
+        # Doing this once saves massive PCIe transfer times
+        print("Moving corpus TF-IDF matrix to GPU VRAM...", flush=True)
+        corpus_gpu = cpx_sparse.csr_matrix(retriever.matrix)
+        corpus_gpu_T = corpus_gpu.T # Transpose on GPU
+        
+        for start_q in tqdm(range(0, num_queries, batch_size), desc=f"Retrieving GPU {view_name}"):
+            end_q = min(start_q + batch_size, num_queries)
+            batch_texts = query_texts[start_q:end_q]
+            batch_ids = query_ids[start_q:end_q]
+            curr_batch_size = len(batch_ids)
+            
+            # Vectorize query batch on CPU
+            q_vecs_cpu = retriever.vectorizer.transform(batch_texts)
+            
+            # Move query batch to GPU
+            q_vecs_gpu = cpx_sparse.csr_matrix(q_vecs_cpu)
+            
+            # Massive parallel sparse dot product on GPU
+            scores_mat_gpu = q_vecs_gpu.dot(corpus_gpu_T)
+            
+            # We want Top-K. We can convert back to CPU to use fast_topk, or just use CuPy
+            # CuPy argsort on dense matrix is fast if batch isn't too huge, but scores_mat_gpu is SPARSE.
+            # Fast way: Bring the sparse results back to CPU and use our C++ fast_topk module!
+            scores_mat_cpu = scores_mat_gpu.get() # Transmits only non-zero sparse matrix elements back to CPU
+            
+            # Clean up GPU memory for this batch
+            del q_vecs_gpu
+            del scores_mat_gpu
+            cp.get_default_memory_pool().free_all_blocks()
+            
+            global_top_scores = np.full((curr_batch_size, k), -1.0, dtype=np.float32)
+            global_top_indices = np.full((curr_batch_size, k), -1, dtype=np.int32)
+            
+            try:
+                import fast_topk
+                fast_topk.merge_topk(
+                    scores_mat_cpu.indptr,
+                    scores_mat_cpu.indices,
+                    scores_mat_cpu.data,
+                    0,
+                    k,
+                    global_top_scores,
+                    global_top_indices
+                )
+            except ImportError:
+                pass
+                
+            # Format results for this query batch
+            for i in range(curr_batch_size):
+                q_id = batch_ids[i]
+                valid_mask = global_top_indices[i] != -1
+                final_scores = global_top_scores[i][valid_mask]
+                final_indices = global_top_indices[i][valid_mask]
+                
+                if len(final_scores) > 0:
+                    sort_idx = np.argsort(-final_scores)
+                    sorted_scores = final_scores[sort_idx]
+                    sorted_indices = final_indices[sort_idx]
+                    
+                    for rank, (score, c_idx) in enumerate(zip(sorted_scores, sorted_indices), start=1):
+                        cand_id = retriever.corpus_ids[c_idx]
+                        all_results.append({
+                            "s1_id": q_id,
+                            "s2_id": cand_id,
+                            "view": view_name,
+                            "rank": rank,
+                            "score": score
+                        })
+                        
+        del corpus_gpu
+        del corpus_gpu_T
+        cp.get_default_memory_pool().free_all_blocks()
+        
         return pd.DataFrame(all_results)
     
     # Optimized batch retrieval with corpus chunking (for SparseRetriever)

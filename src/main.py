@@ -3,7 +3,7 @@ import argparse
 import pandas as pd
 from preprocess import normalize_dataframe
 from features import calculate_record_quality, generate_fingerprints
-from retrieval import create_views, SparseRetriever, MaskedSparseRetriever, DenseRetriever, batch_retrieve, reciprocal_rank_fusion
+from retrieval import create_views, SparseRetriever, MaskedSparseRetriever, CuPySparseRetriever, DenseRetriever, batch_retrieve, reciprocal_rank_fusion
 from evidence import calculate_pairwise_evidence, build_idf_dict
 from competition import compute_competition_features, compute_popularity_features
 from train import construct_training_data, train_lightgbm, get_hard_negatives
@@ -101,7 +101,7 @@ def run_phase(phase: str, data_dir: str, output_dir: str, start_row: int = None,
         candidate_dfs = []
         
         print("Building TF-IDF Retriever for Name View...", flush=True)
-        retriever_name = MaskedSparseRetriever(method='tfidf', max_df_tokens=50000)
+        retriever_name = CuPySparseRetriever(method='tfidf')
         retriever_name.fit(df_corpus, id_col='entity_id', text_col='name_view')
         
         print("Retrieving candidates based on Name View...")
@@ -110,7 +110,7 @@ def run_phase(phase: str, data_dir: str, output_dir: str, start_row: int = None,
             candidate_dfs.append(res_name)
             
         print("Building TF-IDF Retriever for Address View...", flush=True)
-        retriever_addr = MaskedSparseRetriever(method='tfidf', max_df_tokens=50000)
+        retriever_addr = CuPySparseRetriever(method='tfidf')
         retriever_addr.fit(df_corpus, id_col='entity_id', text_col='address_view')
         
         print("Retrieving candidates based on Address View...")
