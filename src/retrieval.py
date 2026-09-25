@@ -23,11 +23,11 @@ def create_views(df: pd.DataFrame) -> pd.DataFrame:
     
     return df
 
-class SparseRetriever:
+class OldSparseRetriever:
     """
-    Implements BM25 and TF-IDF Retrieval over a specific view.
+    Original slow implementation for correctness comparison.
     """
-    def __init__(self, method: str = 'bm25'):
+    def __init__(self, method: str = 'tfidf'):
         self.method = method
         self.vectorizer = None
         self.bm25_model = None
@@ -36,83 +36,103 @@ class SparseRetriever:
         self.matrix = None
 
     def fit(self, df_corpus: pd.DataFrame, id_col: str, text_col: str):
-        """
-        Build index over the S2/S3 corpus.
-        """
         self.corpus_ids = df_corpus[id_col].tolist()
         self.corpus_texts = df_corpus[text_col].tolist()
-        
-        if self.method == 'bm25':
-            # BM25 expects tokenized documents
-            tokenized_corpus = [doc.split() for doc in self.corpus_texts]
-            self.bm25_model = BM25Okapi(tokenized_corpus)
-        elif self.method == 'tfidf':
+        if self.method == 'tfidf':
             self.vectorizer = TfidfVectorizer(analyzer='word', stop_words=None, min_df=1)
             self.matrix = self.vectorizer.fit_transform(self.corpus_texts)
-        else:
-            raise ValueError(f"Unknown retrieval method {self.method}")
 
     def retrieve(self, query: str, k: int = 20) -> List[Dict[str, Any]]:
-        """
-        Retrieve top K candidates for a single query.
-        """
         if not query.strip():
             return []
-
-        if self.method == 'bm25':
-            tokenized_query = query.split()
-            scores = self.bm25_model.get_scores(tokenized_query)
-            # Get top K indices
-            top_k_indices = np.argsort(scores)[::-1][:k]
-            
-            results = []
-            for rank, idx in enumerate(top_k_indices, start=1):
-                if scores[idx] > 0: # Only return if there's some match
-                    results.append({
-                        "candidate_id": self.corpus_ids[idx],
-                        "score": scores[idx],
-                        "rank": rank
-                    })
-            return results
-
-        elif self.method == 'tfidf':
+        if self.method == 'tfidf':
             q_vec = self.vectorizer.transform([query])
             scores = (self.matrix * q_vec.T).toarray().flatten()
             top_k_indices = np.argsort(scores)[::-1][:k]
-            
             results = []
             for rank, idx in enumerate(top_k_indices, start=1):
                 if scores[idx] > 0:
-                    results.append({
-                        "candidate_id": self.corpus_ids[idx],
-                        "score": float(scores[idx]),
-                        "rank": rank
-                    })
+                    results.append({"candidate_id": self.corpus_ids[idx], "score": float(scores[idx]), "rank": rank})
             return results
         return []
 
-def batch_retrieve(queries_df: pd.DataFrame, retriever: SparseRetriever, q_id_col: str, q_text_col: str, view_name: str, k: int = 20) -> pd.DataFrame:
+class SparseRetriever:
     """
-    Retrieve for a batch of queries and return a DataFrame of candidates.
-    Columns: s1_id, s2_id, view, rank, score
+    Optimized implementation using sparse batch matrix multiplication and fast Top-K.
     """
+    def __init__(self, method: str = 'tfidf'):
+        self.method = method
+        self.vectorizer = None
+        self.corpus_ids = []
+        self.corpus_texts = []
+        self.matrix = None
+
+    def fit(self, df_corpus: pd.DataFrame, id_col: str, text_col: str):
+        self.corpus_ids = df_corpus[id_col].tolist()
+        self.corpus_texts = df_corpus[text_col].tolist()
+        if self.method == 'tfidf':
+            self.vectorizer = TfidfVectorizer(analyzer='word', stop_words=None, min_df=1)
+            self.matrix = self.vectorizer.fit_transform(self.corpus_texts)
+
+def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_col: str, view_name: str, k: int = 20, batch_size: int = 1000) -> pd.DataFrame:
     all_results = []
     
-    # In a real Kaggle env, this should use multiprocessing or batching for speed
-    for _, row in queries_df.iterrows():
-        q_id = row[q_id_col]
-        q_text = row[q_text_col]
-        
-        candidates = retriever.retrieve(q_text, k=k)
-        for c in candidates:
-            all_results.append({
-                "s1_id": q_id,
-                "s2_id": c['candidate_id'],
-                "view": view_name,
-                "rank": c['rank'],
-                "score": c['score']
-            })
+    if isinstance(retriever, OldSparseRetriever):
+        for _, row in queries_df.iterrows():
+            q_id = row[q_id_col]
+            q_text = row[q_text_col]
+            candidates = retriever.retrieve(q_text, k=k)
+            for c in candidates:
+                all_results.append({"s1_id": q_id, "s2_id": c['candidate_id'], "view": view_name, "rank": c['rank'], "score": c['score']})
+        return pd.DataFrame(all_results)
     
+    # Optimized batch retrieval
+    query_texts = queries_df[q_text_col].tolist()
+    query_ids = queries_df[q_id_col].tolist()
+    
+    # Process in batches to limit memory usage
+    for start_idx in range(0, len(query_texts), batch_size):
+        end_idx = min(start_idx + batch_size, len(query_texts))
+        batch_texts = query_texts[start_idx:end_idx]
+        batch_ids = query_ids[start_idx:end_idx]
+        
+        # Sparse matrix of query embeddings (BatchSize x VocabSize)
+        q_vecs = retriever.vectorizer.transform(batch_texts)
+        
+        # Dot product with corpus transpose -> (BatchSize x CorpusSize)
+        scores_mat = q_vecs.dot(retriever.matrix.T)
+        
+        # Iterate over rows in the sparse scores matrix
+        for i in range(scores_mat.shape[0]):
+            q_id = batch_ids[i]
+            row_start = scores_mat.indptr[i]
+            row_end = scores_mat.indptr[i+1]
+            
+            if row_start == row_end:
+                continue # No matches
+                
+            row_data = scores_mat.data[row_start:row_end]
+            row_indices = scores_mat.indices[row_start:row_end]
+            
+            num_non_zero = len(row_data)
+            
+            if num_non_zero > k:
+                # Get indices of top K in row_data
+                top_k_local = np.argpartition(row_data, -k)[-k:]
+                # Sort these top K precisely
+                sorted_local = top_k_local[np.argsort(-row_data[top_k_local])]
+            else:
+                sorted_local = np.argsort(-row_data)
+                
+            rank = 1
+            for local_idx in sorted_local:
+                score = float(row_data[local_idx])
+                if score > 0:
+                    corpus_idx = row_indices[local_idx]
+                    cand_id = retriever.corpus_ids[corpus_idx]
+                    all_results.append({"s1_id": q_id, "s2_id": cand_id, "view": view_name, "rank": rank, "score": score})
+                    rank += 1
+                    
     return pd.DataFrame(all_results)
             
 class DenseRetriever:
