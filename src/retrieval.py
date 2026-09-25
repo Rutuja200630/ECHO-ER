@@ -355,8 +355,12 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_co
         # Doing this once saves massive PCIe transfer times
         print("Moving corpus TF-IDF matrix to GPU VRAM...", flush=True)
         # BUG FIX: Transpose on CPU and convert to CSR *before* moving to GPU
-        # CuPy's csr.dot(csc) can silently fail and return an empty matrix.
+        # CuPy's cuSPARSE backend silently fails (returns empty matrix) if indptr/indices are int64.
+        # We MUST explicitly cast to int32 and float32.
         corpus_T_cpu = retriever.matrix.T.tocsr()
+        corpus_T_cpu.data = corpus_T_cpu.data.astype(np.float32)
+        corpus_T_cpu.indices = corpus_T_cpu.indices.astype(np.int32)
+        corpus_T_cpu.indptr = corpus_T_cpu.indptr.astype(np.int32)
         corpus_gpu_T = cpx_sparse.csr_matrix(corpus_T_cpu)
         
         for start_q in tqdm(range(0, num_queries, batch_size), desc=f"Retrieving GPU {view_name}"):
@@ -367,6 +371,9 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_co
             
             # Vectorize query batch on CPU
             q_vecs_cpu = retriever.vectorizer.transform(batch_texts)
+            q_vecs_cpu.data = q_vecs_cpu.data.astype(np.float32)
+            q_vecs_cpu.indices = q_vecs_cpu.indices.astype(np.int32)
+            q_vecs_cpu.indptr = q_vecs_cpu.indptr.astype(np.int32)
             
             # Move query batch to GPU
             q_vecs_gpu = cpx_sparse.csr_matrix(q_vecs_cpu)
