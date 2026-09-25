@@ -33,9 +33,9 @@ def debug_retrieval():
         df_corpus = pd.concat([df_s2, df_s3], ignore_index=True)
         
         sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-        from main import create_multi_view_df
-        df_s1 = create_multi_view_df(df_s1)
-        df_corpus = create_multi_view_df(df_corpus)
+        from retrieval import create_views
+        df_s1 = create_views(df_s1)
+        df_corpus = create_views(df_corpus)
         
     df_s1['name_view'] = df_s1['name_view'].fillna('')
     df_corpus['name_view'] = df_corpus['name_view'].fillna('')
