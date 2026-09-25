@@ -354,8 +354,10 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_co
         # Move Corpus matrix to GPU
         # Doing this once saves massive PCIe transfer times
         print("Moving corpus TF-IDF matrix to GPU VRAM...", flush=True)
-        corpus_gpu = cpx_sparse.csr_matrix(retriever.matrix)
-        corpus_gpu_T = corpus_gpu.T # Transpose on GPU
+        # BUG FIX: Transpose on CPU and convert to CSR *before* moving to GPU
+        # CuPy's csr.dot(csc) can silently fail and return an empty matrix.
+        corpus_T_cpu = retriever.matrix.T.tocsr()
+        corpus_gpu_T = cpx_sparse.csr_matrix(corpus_T_cpu)
         
         for start_q in tqdm(range(0, num_queries, batch_size), desc=f"Retrieving GPU {view_name}"):
             end_q = min(start_q + batch_size, num_queries)
@@ -436,7 +438,6 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_co
                             "score": score
                         })
                         
-        del corpus_gpu
         del corpus_gpu_T
         cp.get_default_memory_pool().free_all_blocks()
         
