@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from .preprocess import extract_numbers
+from preprocess import extract_numbers
 
 def calculate_record_quality(df: pd.DataFrame) -> pd.DataFrame:
     """
