@@ -92,11 +92,11 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_co
     num_queries = len(query_texts)
     num_corpus = retriever.matrix.shape[0]
     import time
+    from tqdm import tqdm
     
-    for start_q in range(0, num_queries, batch_size):
-        if start_q % (batch_size * 5) == 0:
-            print(f"  -> Processing query {start_q}/{num_queries} ({(start_q/num_queries)*100:.1f}%)", flush=True)
-            
+    print(f"Starting batched retrieval ({num_queries} queries, batch size: {batch_size}, chunk size: {corpus_chunk_size})", flush=True)
+    
+    for start_q in tqdm(range(0, num_queries, batch_size), desc=f"Retrieving {view_name}"):
         end_q = min(start_q + batch_size, num_queries)
         batch_texts = query_texts[start_q:end_q]
         batch_ids = query_ids[start_q:end_q]
