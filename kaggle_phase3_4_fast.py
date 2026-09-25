@@ -1,12 +1,15 @@
 """
-ECHO-ER Phase 3 & 4: OPTIMIZED Multi-View Sparse Retrieval
-============================================================
-Strategy: Inverted Index + BM25 scoring
-- Never computes a full N x M matrix
-- Only scores candidates that share at least 1 token with query
-- Queries processed in parallel across all 4 CPU cores
-- Checkpointed per view (resume safely if Kaggle times out)
-- BM25 parameters tunable via config
+ECHO-ER Phase 3 & 4: FIXED Multi-View Sparse Retrieval
+=======================================================
+ROOT CAUSE OF HANG: ProcessPoolExecutor returning 16M+ numpy arrays
+through IPC pipes causes deadlock.
+
+FIX:
+- Single-threaded BM25 querying (no IPC overhead)
+- Write results chunk-by-chunk directly to disk (no big arrays in RAM)
+- Progress print every 50k queries so you know it's alive
+- Index built once & cached as .pkl, reused on restart
+- Per-view checkpoints (skip already done views)
 """
 import os
 import sys
@@ -18,22 +21,23 @@ import math
 import numpy as np
 import pandas as pd
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing
 from typing import List, Dict, Tuple
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # ============================================================
 # CONFIG
 # ============================================================
-TOP_K      = 30          # Candidates to retrieve per query
-BM25_K1    = 1.5         # BM25 term saturation
-BM25_B     = 0.75        # BM25 length normalization
-MAX_VOCAB  = 500_000     # Cap vocabulary size
-MIN_DF     = 2           # Token must appear in >= 2 docs
+TOP_K        = 30
+BM25_K1      = 1.5
+BM25_B       = 0.75
+MAX_VOCAB    = 300_000
+MIN_DF       = 2
+CHUNK_WRITE  = 50_000      # write results every N queries
 
-CACHE_DIR      = "/kaggle/working/cache"
-OUT_DIR        = "/kaggle/working/retrieval"
-PROCESSED_DIR  = "/kaggle/working/data/processed/train"
+CACHE_DIR     = "/kaggle/working/cache"
+OUT_DIR       = "/kaggle/working/retrieval"
+PROCESSED_DIR = "/kaggle/working/data/processed/train"
 
 VIEWS = {
     "name":    ["name_norm"],
@@ -50,201 +54,204 @@ os.makedirs(OUT_DIR, exist_ok=True)
 _RE_TOKEN = re.compile(r'\b\w+\b')
 
 def tokenize(text: str) -> List[str]:
-    if not text or pd.isna(text): return []
-    return _RE_TOKEN.findall(text.lower())
+    if not text or (isinstance(text, float) and math.isnan(text)):
+        return []
+    return _RE_TOKEN.findall(str(text).lower())
 
 def build_text(row: pd.Series, cols: List[str]) -> str:
-    return " ".join(str(row.get(c, "")) for c in cols if not pd.isna(row.get(c, "")))
+    parts = []
+    for c in cols:
+        v = row.get(c, "")
+        if v and v != "nan":
+            parts.append(str(v))
+    return " ".join(parts)
 
 # ============================================================
 # BM25 INVERTED INDEX
 # ============================================================
 class BM25Index:
-    """
-    Fast BM25 index backed by Python arrays.
-    - Build: O(sum of document lengths)
-    - Query: O(query_tokens x mean_posting_list_length)
-    """
     def __init__(self, k1=BM25_K1, b=BM25_B):
         self.k1 = k1
         self.b = b
-        self.doc_ids = None          # np.array: position → entity_id
-        self.doc_len = None          # np.array: position → token_count
+        self.doc_ids = None
+        self.doc_len = None
         self.avgdl = 0.0
         self.N = 0
-        # inverted index: token_id → np.array([pos, tf, ...])
         self.token2id: Dict[str, int] = {}
-        self.postings: List[Tuple[np.ndarray, np.ndarray]] = []  # (positions, tfs)
-        self.idf: np.ndarray = None  # per token
+        self.postings: List[Tuple[np.ndarray, np.ndarray]] = []
+        self.idf: np.ndarray = None
 
     def build(self, texts: List[str], doc_ids: np.ndarray):
-        print("  [BM25] Tokenizing and counting term frequencies...")
+        print("  [BM25] Tokenizing corpus...")
         t0 = time.time()
         self.N = len(texts)
         self.doc_ids = doc_ids
 
-        # First pass: compute doc lengths and raw term freqs per doc
-        raw_index: Dict[str, List] = defaultdict(list)  # token → [(pos, tf)]
+        raw_index: Dict[str, List] = defaultdict(list)
         doc_lengths = np.zeros(self.N, dtype=np.int32)
 
         for pos, text in enumerate(texts):
             tokens = tokenize(text)
             doc_lengths[pos] = len(tokens)
             if not tokens: continue
-            # Count TF in this doc
             counts: Dict[str, int] = {}
             for t in tokens:
                 counts[t] = counts.get(t, 0) + 1
             for t, tf in counts.items():
                 raw_index[t].append((pos, tf))
 
+            if pos > 0 and pos % 1_000_000 == 0:
+                print(f"    Tokenized {pos:,}/{self.N:,} docs...")
+
         self.doc_len = doc_lengths
         self.avgdl = float(doc_lengths.mean()) if self.N > 0 else 1.0
-        print(f"  [BM25] Tokenization done in {time.time()-t0:.1f}s. Vocab before filtering: {len(raw_index):,}")
+        print(f"  [BM25] Tokenized in {time.time()-t0:.1f}s | Vocab: {len(raw_index):,}")
 
-        # Filter by MIN_DF and cap vocab
-        t1 = time.time()
-        filtered = [(t, postings) for t, postings in raw_index.items() if len(postings) >= MIN_DF]
-        # Sort by df descending to drop least frequent if over MAX_VOCAB
+        # Filter by df
+        filtered = [(t, pl) for t, pl in raw_index.items() if len(pl) >= MIN_DF]
         filtered.sort(key=lambda x: -len(x[1]))
         filtered = filtered[:MAX_VOCAB]
-        print(f"  [BM25] Vocab after filtering: {len(filtered):,}  ({time.time()-t1:.1f}s)")
+        print(f"  [BM25] Vocab after filter: {len(filtered):,}")
 
-        # Build compact arrays
         t2 = time.time()
         idf_values = []
-        for tid, (token, postings_list) in enumerate(filtered):
+        for tid, (token, pl) in enumerate(filtered):
             self.token2id[token] = tid
-            df = len(postings_list)
-            # BM25 IDF: log((N - df + 0.5) / (df + 0.5) + 1)
+            df = len(pl)
             idf = math.log((self.N - df + 0.5) / (df + 0.5) + 1.0)
             idf_values.append(idf)
-            pos_arr = np.array([p for p, _ in postings_list], dtype=np.int32)
-            tf_arr  = np.array([tf for _, tf in postings_list], dtype=np.float32)
+            pos_arr = np.array([p for p, _ in pl], dtype=np.int32)
+            tf_arr  = np.array([tf for _, tf in pl], dtype=np.float32)
             self.postings.append((pos_arr, tf_arr))
 
         self.idf = np.array(idf_values, dtype=np.float32)
         del raw_index, filtered; gc.collect()
-        print(f"  [BM25] Index built in {time.time()-t2:.1f}s. Total build time: {time.time()-t0:.1f}s")
+        print(f"  [BM25] Index ready in {time.time()-t0:.1f}s total")
 
-    def query_one(self, text: str, top_k: int = TOP_K) -> Tuple[np.ndarray, np.ndarray]:
-        """Score all candidates matching query tokens. Return top_k (positions, scores)."""
+    def query_one(self, text: str) -> Tuple[np.ndarray, np.ndarray]:
         tokens = tokenize(text)
         if not tokens:
             return np.array([], dtype=np.int32), np.array([], dtype=np.float32)
 
-        # Accumulate scores for matching candidates
         scores: Dict[int, float] = {}
-        seen_tids = set()
-
         for token in set(tokens):
             tid = self.token2id.get(token)
-            if tid is None or tid in seen_tids: continue
-            seen_tids.add(tid)
-
+            if tid is None: continue
             idf = float(self.idf[tid])
             pos_arr, tf_arr = self.postings[tid]
-
             for i in range(len(pos_arr)):
                 pos = int(pos_arr[i])
                 tf  = float(tf_arr[i])
                 dl  = float(self.doc_len[pos])
-                # BM25 score
-                numerator   = tf * (self.k1 + 1.0)
-                denominator = tf + self.k1 * (1.0 - self.b + self.b * dl / self.avgdl)
-                delta = idf * numerator / denominator
-                scores[pos] = scores.get(pos, 0.0) + delta
+                num = tf * (self.k1 + 1.0)
+                den = tf + self.k1 * (1.0 - self.b + self.b * dl / self.avgdl)
+                scores[pos] = scores.get(pos, 0.0) + idf * num / den
 
         if not scores:
             return np.array([], dtype=np.int32), np.array([], dtype=np.float32)
 
-        # Fast top-K via argpartition
-        positions = np.array(list(scores.keys()), dtype=np.int32)
-        score_arr = np.array(list(scores.values()), dtype=np.float32)
+        positions  = np.fromiter(scores.keys(),   dtype=np.int32,   count=len(scores))
+        score_arr  = np.fromiter(scores.values(), dtype=np.float32, count=len(scores))
 
-        if len(score_arr) > top_k:
-            idx = np.argpartition(score_arr, -top_k)[-top_k:]
+        if len(score_arr) > TOP_K:
+            idx = np.argpartition(score_arr, -TOP_K)[-TOP_K:]
             positions, score_arr = positions[idx], score_arr[idx]
 
         order = np.argsort(-score_arr)
         return positions[order], score_arr[order]
 
-    def query_batch(self, texts: List[str], top_k: int = TOP_K) -> Tuple[np.ndarray, np.ndarray]:
-        """Query multiple texts, return (n_queries x top_k) arrays."""
-        n = len(texts)
-        all_pos    = np.full((n, top_k), -1, dtype=np.int32)
-        all_scores = np.zeros((n, top_k), dtype=np.float32)
-        for i, text in enumerate(texts):
-            pos, scores = self.query_one(text, top_k)
-            k = len(pos)
-            if k > 0:
-                all_pos[i, :k]    = pos[:k]
-                all_scores[i, :k] = scores[:k]
-        return all_pos, all_scores
-
     def save(self, path: str):
         with open(path, 'wb') as f:
             pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
-        print(f"  [BM25] Index saved to {path}")
+        print(f"  [BM25] Index cached → {path}")
 
     @staticmethod
     def load(path: str) -> 'BM25Index':
         with open(path, 'rb') as f:
             idx = pickle.load(f)
-        print(f"  [BM25] Index loaded from {path}")
         return idx
 
 # ============================================================
-# PARALLEL QUERY WORKER
+# INCREMENTAL CHUNK-WRITING QUERY LOOP
 # ============================================================
-def _query_worker(args):
-    """Runs query_batch on a slice of queries. Used by ProcessPoolExecutor."""
-    index_path, texts_slice, top_k = args
-    idx = BM25Index.load(index_path)
-    return idx.query_batch(texts_slice, top_k)
-
-def parallel_query(index_path: str, query_texts: List[str],
-                   top_k: int = TOP_K, num_workers: int = 4) -> Tuple[np.ndarray, np.ndarray]:
+def query_and_write(index: BM25Index,
+                    s1_ids: np.ndarray,
+                    s1_texts: List[str],
+                    cand_ids: np.ndarray,
+                    view_name: str,
+                    out_path: str):
     """
-    Distributes query_texts evenly across CPU cores.
-    Each worker loads the cached index independently (avoids pickling large objects).
+    Query every S1 record, write results to parquet in CHUNK_WRITE-sized chunks.
+    No large arrays ever sit in memory. Never returns big data structures.
     """
-    n = len(query_texts)
-    chunk_size = math.ceil(n / num_workers)
-    chunks = [query_texts[i:i+chunk_size] for i in range(0, n, chunk_size)]
+    n = len(s1_ids)
+    writer = None
+    schema = pa.schema([
+        pa.field("s1_id",        pa.string()),
+        pa.field("candidate_id", pa.string()),
+        pa.field("view",         pa.string()),
+        pa.field("rank",         pa.int16()),
+        pa.field("score",        pa.float32()),
+    ])
 
-    all_pos    = np.full((n, top_k), -1, dtype=np.int32)
-    all_scores = np.zeros((n, top_k), dtype=np.float32)
+    buf_s1    = []
+    buf_cand  = []
+    buf_rank  = []
+    buf_score = []
 
-    args = [(index_path, chunk, top_k) for chunk in chunks]
-    start = 0
-    with ProcessPoolExecutor(max_workers=num_workers) as pool:
-        for (pos_chunk, score_chunk) in pool.map(_query_worker, args):
-            end = start + pos_chunk.shape[0]
-            all_pos[start:end]    = pos_chunk
-            all_scores[start:end] = score_chunk
-            start = end
-            print(f"    ✅ Worker done  [{end:,}/{n:,}]")
+    t0 = time.time()
 
-    return all_pos, all_scores
+    def flush():
+        nonlocal writer, buf_s1, buf_cand, buf_rank, buf_score
+        if not buf_s1: return
+        batch = pa.record_batch({
+            "s1_id":        pa.array(buf_s1,    type=pa.string()),
+            "candidate_id": pa.array(buf_cand,  type=pa.string()),
+            "view":         pa.array([view_name] * len(buf_s1), type=pa.string()),
+            "rank":         pa.array(buf_rank,  type=pa.int16()),
+            "score":        pa.array(buf_score, type=pa.float32()),
+        })
+        if writer is None:
+            writer = pq.ParquetWriter(out_path, schema=batch.schema)
+        writer.write_batch(batch)
+        buf_s1, buf_cand, buf_rank, buf_score = [], [], [], []
+
+    for i, (s1_id, text) in enumerate(zip(s1_ids, s1_texts)):
+        positions, scores = index.query_one(text)
+
+        for rank_idx, (pos, sc) in enumerate(zip(positions, scores), start=1):
+            buf_s1.append(str(s1_id))
+            buf_cand.append(str(cand_ids[pos]))
+            buf_rank.append(rank_idx)
+            buf_score.append(float(sc))
+
+        if (i + 1) % CHUNK_WRITE == 0:
+            flush()
+            elapsed = time.time() - t0
+            rate = (i + 1) / elapsed
+            eta  = (n - i - 1) / rate
+            print(f"    [{view_name}] {i+1:,}/{n:,} | "
+                  f"{elapsed:.0f}s elapsed | ETA {eta:.0f}s")
+
+    flush()
+    if writer: writer.close()
 
 # ============================================================
-# MAIN PIPELINE
+# MAIN
 # ============================================================
-def load_view_texts(view_cols: List[str]) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
-    """Load S1 query texts and candidate texts for the given view columns."""
-    needed = ["entity_id"] + [c for c in view_cols if c != "entity_id"]
+def load_view_texts(view_cols: List[str]):
+    needed = ["entity_id"] + view_cols
 
     def safe_read(path):
         all_cols = pd.read_csv(path, sep='\t', nrows=0).columns.tolist()
-        usecols = [c for c in needed if c in all_cols]
-        return pd.read_csv(path, sep='\t', usecols=usecols, dtype=str).fillna("")
+        use = [c for c in needed if c in all_cols]
+        return pd.read_csv(path, sep='\t', usecols=use, dtype=str).fillna("")
 
     s1 = safe_read(os.path.join(PROCESSED_DIR, "train_source1_norm.tsv"))
     s2 = safe_read(os.path.join(PROCESSED_DIR, "train_source2_norm.tsv"))
     s3 = safe_read(os.path.join(PROCESSED_DIR, "train_source3_norm.tsv"))
 
-    s1_ids = s1["entity_id"].values
+    s1_ids   = s1["entity_id"].values
     cand_ids = np.concatenate([s2["entity_id"].values, s3["entity_id"].values])
 
     s1_texts   = s1.apply(lambda r: build_text(r, view_cols), axis=1).tolist()
@@ -255,16 +262,16 @@ def load_view_texts(view_cols: List[str]) -> Tuple[np.ndarray, np.ndarray, List[
     del s1, s2, s3; gc.collect()
     return s1_ids, cand_ids, s1_texts, cand_texts
 
+
 def run_phase3_4():
-    num_cores = multiprocessing.cpu_count()
-    print(f"🚀 Starting Phase 3 & 4 | {num_cores} CPU cores\n")
+    print(f"🚀 Starting Phase 3 & 4 | No multiprocessing IPC deadlocks!\n")
 
     for view_name, view_cols in VIEWS.items():
-        out_path   = os.path.join(OUT_DIR, f"bm25_{view_name}_top{TOP_K}.parquet")
-        idx_path   = os.path.join(CACHE_DIR, f"bm25_{view_name}_index.pkl")
+        out_path = os.path.join(OUT_DIR, f"bm25_{view_name}_top{TOP_K}.parquet")
+        idx_path = os.path.join(CACHE_DIR, f"bm25_{view_name}_index.pkl")
 
         if os.path.exists(out_path):
-            print(f"⏭️  [{view_name.upper()} VIEW] Checkpoint found — skipping.")
+            print(f"⏭️  [{view_name.upper()}] Checkpoint found — skipping.")
             continue
 
         print(f"\n{'='*55}")
@@ -272,59 +279,31 @@ def run_phase3_4():
         print(f"{'='*55}")
         t_view = time.time()
 
-        # --- Load texts ---
         print("  Loading texts...")
         s1_ids, cand_ids, s1_texts, cand_texts = load_view_texts(view_cols)
         print(f"  Queries: {len(s1_ids):,}  |  Candidates: {len(cand_ids):,}")
 
-        # --- Build / Load Index ---
         if os.path.exists(idx_path):
             print("  💾 Loading cached BM25 index...")
             bm25 = BM25Index.load(idx_path)
+            del cand_texts; gc.collect()
         else:
-            print("  🔨 Building BM25 index on candidate corpus...")
-            bm25 = BM25Index(k1=BM25_K1, b=BM25_B)
+            print("  🔨 Building BM25 index...")
+            bm25 = BM25Index()
             bm25.build(cand_texts, cand_ids)
             bm25.save(idx_path)
+            del cand_texts; gc.collect()
 
-        del cand_texts; gc.collect()
-
-        # --- Query in Parallel ---
-        print(f"  🔍 Querying Top-{TOP_K} across {num_cores} cores...")
+        print(f"\n  🔍 Querying {len(s1_ids):,} records → writing every {CHUNK_WRITE:,} rows...")
         t_q = time.time()
-        pos_matrix, score_matrix = parallel_query(idx_path, s1_texts, TOP_K, num_workers=num_cores)
-        print(f"  Querying done in {time.time()-t_q:.1f}s")
+        query_and_write(bm25, s1_ids, s1_texts, cand_ids, view_name, out_path)
+        print(f"  ✅ [{view_name.upper()}] Querying done in {time.time()-t_q:.1f}s")
 
-        del s1_texts, bm25; gc.collect()
+        del bm25, s1_ids, s1_texts, cand_ids; gc.collect()
+        print(f"  🎉 [{view_name.upper()}] Total: {time.time()-t_view:.1f}s")
 
-        # --- Flatten & Save ---
-        print("  💾 Saving results as parquet...")
-        n = len(s1_ids)
-        q_ids_rep  = np.repeat(s1_ids, TOP_K)
-        ranks_flat = np.tile(np.arange(1, TOP_K + 1), n)
-        scores_flat = score_matrix.flatten()
+    print("\n✅ All views complete. Phase 3 & 4 done!")
 
-        # Map position indices → actual candidate entity_ids
-        flat_pos    = pos_matrix.flatten()
-        valid_mask  = flat_pos >= 0
-        cand_mapped = np.full(len(flat_pos), "", dtype=object)
-        cand_mapped[valid_mask] = cand_ids[flat_pos[valid_mask]]
-
-        df_out = pd.DataFrame({
-            "s1_id":       q_ids_rep,
-            "candidate_id": cand_mapped,
-            "view":        view_name,
-            "rank":        ranks_flat,
-            "score":       scores_flat,
-        })
-        # Drop empty (no-match) rows
-        df_out = df_out[df_out["candidate_id"] != ""].reset_index(drop=True)
-        df_out.to_parquet(out_path, index=False)
-
-        print(f"  ✅ [{view_name.upper()} VIEW] Done | {len(df_out):,} pairs | {time.time()-t_view:.1f}s total")
-        del df_out, q_ids_rep, cand_mapped, pos_matrix, score_matrix; gc.collect()
-
-    print("\n🎉 All views checkpointed. Phase 3 & 4 complete!")
 
 if __name__ == "__main__":
     run_phase3_4()
