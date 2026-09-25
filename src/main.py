@@ -42,9 +42,31 @@ def run_phase(phase: str, data_dir: str, output_dir: str):
         print("Preprocessing complete.")
         
     elif phase == "features":
-        print("Running Feature Engineering...")
-        # df = calculate_record_quality(df)
-        # df = generate_fingerprints(df)
+        print("Running Feature Engineering (Phases 3 & 4)...")
+        for source in ['norm_train_source1.tsv', 'norm_train_source2.tsv', 'norm_train_source3.tsv']:
+            path = os.path.join(output_dir, source)
+            if not os.path.exists(path):
+                print(f"Skipping {source}, file not found at {path}. Did you run --phase preprocess?")
+                continue
+                
+            print(f"Loading {source}...")
+            df = pd.read_csv(path, sep='\t', dtype=str)
+            
+            # Convert NaN back to empty strings where needed, otherwise len() might break if NaNs sneaked in
+            df['norm_name'] = df['norm_name'].fillna("")
+            df['norm_address'] = df['norm_address'].fillna("")
+            
+            print(f"Calculating record quality for {source}...")
+            df_feat = calculate_record_quality(df)
+            
+            print(f"Generating fingerprints for {source}...")
+            df_feat = generate_fingerprints(df_feat)
+            
+            out_name = source.replace('norm_', 'feat_')
+            out_path = os.path.join(output_dir, out_name)
+            print(f"Saving to {out_path}...")
+            df_feat.to_csv(out_path, sep='\t', index=False)
+            
         print("Feature engineering complete.")
         
     elif phase == "retrieval":
