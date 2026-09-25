@@ -396,8 +396,23 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_co
                     global_top_scores,
                     global_top_indices
                 )
-            except ImportError:
-                pass
+            except Exception as e:
+                # Python fallback if fast_topk is missing or throws type error
+                for i in range(curr_batch_size):
+                    row_start = scores_mat_cpu.indptr[i]
+                    row_end = scores_mat_cpu.indptr[i+1]
+                    if row_start == row_end:
+                        continue
+                    row_data = scores_mat_cpu.data[row_start:row_end]
+                    row_cols = scores_mat_cpu.indices[row_start:row_end]
+                    
+                    if len(row_data) > k:
+                        top_k_local = np.argpartition(row_data, -k)[-k:]
+                        global_top_scores[i] = row_data[top_k_local]
+                        global_top_indices[i] = row_cols[top_k_local]
+                    else:
+                        global_top_scores[i, :len(row_data)] = row_data
+                        global_top_indices[i, :len(row_cols)] = row_cols
                 
             # Format results for this query batch
             for i in range(curr_batch_size):
