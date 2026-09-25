@@ -105,7 +105,7 @@ def run_phase(phase: str, data_dir: str, output_dir: str, start_row: int = None,
         retriever_name.fit(df_corpus, id_col='entity_id', text_col='name_view')
         
         print("Retrieving candidates based on Name View...")
-        res_name = batch_retrieve(df_s1, retriever_name, 'entity_id', 'name_view', 'name_view', k=50, batch_size=20000, corpus_chunk_size=1000000)
+        res_name = batch_retrieve(df_s1, retriever_name, 'entity_id', 'name_view', 'name_view', k=50, batch_size=1000, corpus_chunk_size=1000000)
         if not res_name.empty:
             candidate_dfs.append(res_name)
             
@@ -114,7 +114,7 @@ def run_phase(phase: str, data_dir: str, output_dir: str, start_row: int = None,
         retriever_addr.fit(df_corpus, id_col='entity_id', text_col='address_view')
         
         print("Retrieving candidates based on Address View...")
-        res_addr = batch_retrieve(df_s1, retriever_addr, 'entity_id', 'address_view', 'address_view', k=50, batch_size=20000, corpus_chunk_size=1000000)
+        res_addr = batch_retrieve(df_s1, retriever_addr, 'entity_id', 'address_view', 'address_view', k=50, batch_size=1000, corpus_chunk_size=1000000)
         if not res_addr.empty:
             candidate_dfs.append(res_addr)
             
