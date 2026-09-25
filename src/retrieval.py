@@ -117,45 +117,55 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_co
             # Sparse dot product
             scores_mat = q_vecs.dot(corpus_chunk_mat.T)
             
-            # Extract top K for each query in this chunk
-            for i in range(curr_batch_size):
-                row_start = scores_mat.indptr[i]
-                row_end = scores_mat.indptr[i+1]
-                
-                if row_start == row_end:
-                    continue
+            try:
+                import fast_topk
+                fast_topk.merge_topk(
+                    scores_mat.indptr,
+                    scores_mat.indices,
+                    scores_mat.data,
+                    start_c,
+                    k,
+                    global_top_scores,
+                    global_top_indices
+                )
+            except ImportError:
+                # Fallback to Python looping
+                for i in range(curr_batch_size):
+                    row_start = scores_mat.indptr[i]
+                    row_end = scores_mat.indptr[i+1]
                     
-                row_data = scores_mat.data[row_start:row_end]
-                row_cols = scores_mat.indices[row_start:row_end]
-                
-                num_non_zero = len(row_data)
-                if num_non_zero > k:
-                    top_k_local = np.argpartition(row_data, -k)[-k:]
-                    chunk_scores = row_data[top_k_local]
-                    chunk_indices = row_cols[top_k_local] + start_c # map to global corpus index
-                else:
-                    chunk_scores = row_data
-                    chunk_indices = row_cols + start_c
+                    if row_start == row_end:
+                        continue
+                        
+                    row_data = scores_mat.data[row_start:row_end]
+                    row_cols = scores_mat.indices[row_start:row_end]
                     
-                # Merge with global top K for this query
-                merged_scores = np.concatenate((global_top_scores[i], chunk_scores))
-                merged_indices = np.concatenate((global_top_indices[i], chunk_indices))
-                
-                # Get the new top K from the merged array
-                # Filter out -1 defaults
-                valid_mask = merged_indices != -1
-                if not valid_mask.any():
-                    continue
-                valid_scores = merged_scores[valid_mask]
-                valid_indices = merged_indices[valid_mask]
-                
-                if len(valid_scores) > k:
-                    top_k_merged = np.argpartition(valid_scores, -k)[-k:]
-                    global_top_scores[i] = valid_scores[top_k_merged]
-                    global_top_indices[i] = valid_indices[top_k_merged]
-                else:
-                    global_top_scores[i, :len(valid_scores)] = valid_scores
-                    global_top_indices[i, :len(valid_indices)] = valid_indices
+                    num_non_zero = len(row_data)
+                    if num_non_zero > k:
+                        top_k_local = np.argpartition(row_data, -k)[-k:]
+                        chunk_scores = row_data[top_k_local]
+                        chunk_indices = row_cols[top_k_local] + start_c
+                    else:
+                        chunk_scores = row_data
+                        chunk_indices = row_cols + start_c
+                        
+                    # Merge with global top K for this query
+                    merged_scores = np.concatenate((global_top_scores[i], chunk_scores))
+                    merged_indices = np.concatenate((global_top_indices[i], chunk_indices))
+                    
+                    valid_mask = merged_indices != -1
+                    if not valid_mask.any():
+                        continue
+                    valid_scores = merged_scores[valid_mask]
+                    valid_indices = merged_indices[valid_mask]
+                    
+                    if len(valid_scores) > k:
+                        top_k_merged = np.argpartition(valid_scores, -k)[-k:]
+                        global_top_scores[i] = valid_scores[top_k_merged]
+                        global_top_indices[i] = valid_indices[top_k_merged]
+                    else:
+                        global_top_scores[i, :len(valid_scores)] = valid_scores
+                        global_top_indices[i, :len(valid_indices)] = valid_indices
                     
             # Free chunk matrices immediately
             del scores_mat
