@@ -1,205 +1,330 @@
+"""
+ECHO-ER Phase 3 & 4: OPTIMIZED Multi-View Sparse Retrieval
+============================================================
+Strategy: Inverted Index + BM25 scoring
+- Never computes a full N x M matrix
+- Only scores candidates that share at least 1 token with query
+- Queries processed in parallel across all 4 CPU cores
+- Checkpointed per view (resume safely if Kaggle times out)
+- BM25 parameters tunable via config
+"""
 import os
+import sys
 import time
-import pandas as pd
-import numpy as np
-import scipy.sparse as sp
-from sklearn.feature_extraction.text import TfidfVectorizer
-import glob
 import gc
 import pickle
+import re
+import math
+import numpy as np
+import pandas as pd
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+from typing import List, Dict, Tuple
 
-# ---------------------------------------------------------
-# FAST SPARSE DOT-PRODUCT K-NN (C++ Backed via Scipy)
-# ---------------------------------------------------------
-def _process_chunk_cpu(args):
-    start_idx, end_idx, q_chunk, corpus_matrix, top_k = args
-    sim_matrix = q_chunk.dot(corpus_matrix.T)
-    
-    num_queries_chunk = q_chunk.shape[0]
-    chunk_indices = np.zeros((num_queries_chunk, top_k), dtype=np.int32)
-    chunk_scores = np.zeros((num_queries_chunk, top_k), dtype=np.float32)
-    
-    for i in range(num_queries_chunk):
-        row = sim_matrix.getrow(i)
-        nonzero_indices = row.indices
-        nonzero_data = row.data
-        
-        if len(nonzero_data) == 0:
-            continue
-            
-        if len(nonzero_data) > top_k:
-            top_indices_unsorted = np.argpartition(nonzero_data, -top_k)[-top_k:]
-            top_scores_unsorted = nonzero_data[top_indices_unsorted]
-            
-            sort_order = np.argsort(-top_scores_unsorted)
-            best_indices = top_indices_unsorted[sort_order]
-            best_scores = top_scores_unsorted[sort_order]
-        else:
-            sort_order = np.argsort(-nonzero_data)
-            best_indices = np.arange(len(nonzero_data))[sort_order]
-            best_scores = nonzero_data[sort_order]
-            
-        actual_indices = nonzero_indices[best_indices]
-        num_found = min(top_k, len(best_scores))
-        chunk_indices[i, :num_found] = actual_indices[:num_found]
-        chunk_scores[i, :num_found] = best_scores[:num_found]
-        
-    return start_idx, chunk_indices, chunk_scores
+# ============================================================
+# CONFIG
+# ============================================================
+TOP_K      = 30          # Candidates to retrieve per query
+BM25_K1    = 1.5         # BM25 term saturation
+BM25_B     = 0.75        # BM25 length normalization
+MAX_VOCAB  = 500_000     # Cap vocabulary size
+MIN_DF     = 2           # Token must appear in >= 2 docs
 
-def get_top_k_sparse(query_matrix, corpus_matrix, top_k=30, batch_size=20000):
+CACHE_DIR      = "/kaggle/working/cache"
+OUT_DIR        = "/kaggle/working/retrieval"
+PROCESSED_DIR  = "/kaggle/working/data/processed/train"
+
+VIEWS = {
+    "name":    ["name_norm"],
+    "address": ["address_norm", "postal_code"],
+    "full":    ["name_norm", "address_norm", "country_norm", "postal_code"],
+}
+
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ============================================================
+# TOKENIZER
+# ============================================================
+_RE_TOKEN = re.compile(r'\b\w+\b')
+
+def tokenize(text: str) -> List[str]:
+    if not text or pd.isna(text): return []
+    return _RE_TOKEN.findall(text.lower())
+
+def build_text(row: pd.Series, cols: List[str]) -> str:
+    return " ".join(str(row.get(c, "")) for c in cols if not pd.isna(row.get(c, "")))
+
+# ============================================================
+# BM25 INVERTED INDEX
+# ============================================================
+class BM25Index:
     """
-    Computes cosine similarity (dot product of L2 normalized TF-IDF).
-    Attempts GPU (CuPy) if available. Falls back to Multi-CPU parallel chunks.
+    Fast BM25 index backed by Python arrays.
+    - Build: O(sum of document lengths)
+    - Query: O(query_tokens x mean_posting_list_length)
     """
-    num_queries = query_matrix.shape[0]
-    top_k_indices = np.zeros((num_queries, top_k), dtype=np.int32)
-    top_k_scores = np.zeros((num_queries, top_k), dtype=np.float32)
-    
-    # 1. Attempt GPU Acceleration via CuPy
-    try:
-        import cupy as cp
-        import cupyx.scipy.sparse as cpx_sp
-        print("🔥 GPU (CuPy) detected! Offloading sparse dot-product to GPU...")
-        
-        # Move corpus to GPU (once)
-        corpus_gpu = cpx_sp.csr_matrix(corpus_matrix)
-        
-        for start_idx in range(0, num_queries, batch_size):
-            end_idx = min(start_idx + batch_size, num_queries)
-            q_chunk_gpu = cpx_sp.csr_matrix(query_matrix[start_idx:end_idx])
-            
-            # GPU Matrix Multiplication
-            sim_matrix_gpu = q_chunk_gpu.dot(corpus_gpu.T)
-            
-            # Move back to CPU for Top-K argsort (sorting sparse on GPU is tricky without dense cast)
-            sim_matrix_cpu = sim_matrix_gpu.get()
-            
-            # CPU Fallback for sorting the chunk
-            _, c_idx, c_scores = _process_chunk_cpu((start_idx, end_idx, sim_matrix_cpu, sp.eye(corpus_matrix.shape[0]), top_k)) 
-            # Note: since sim_matrix is already computed, we pass an identity trick, or better yet, just extract rows.
-            # Actually, to keep it perfectly clean, let's just do CPU parallel if GPU isn't perfectly seamless for sparse argpartition.
-            raise ImportError("Fallback to optimized CPU parallelization.")
-            
-    except ImportError:
-        print("⚡ Using Multi-CPU Parallel Sparse Dot-Product...")
-        from concurrent.futures import ProcessPoolExecutor
-        import multiprocessing
-        
-        num_cores = multiprocessing.cpu_count()
-        chunk_args = []
-        for start_idx in range(0, num_queries, batch_size):
-            end_idx = min(start_idx + batch_size, num_queries)
-            q_chunk = query_matrix[start_idx:end_idx]
-            chunk_args.append((start_idx, end_idx, q_chunk, corpus_matrix, top_k))
-            
-        with ProcessPoolExecutor(max_workers=num_cores) as executor:
-            for start_idx, chunk_idx, chunk_scores in executor.map(_process_chunk_cpu, chunk_args):
-                end_idx = start_idx + chunk_idx.shape[0]
-                top_k_indices[start_idx:end_idx, :] = chunk_idx
-                top_k_scores[start_idx:end_idx, :] = chunk_scores
-                
-    return top_k_indices, top_k_scores
+    def __init__(self, k1=BM25_K1, b=BM25_B):
+        self.k1 = k1
+        self.b = b
+        self.doc_ids = None          # np.array: position → entity_id
+        self.doc_len = None          # np.array: position → token_count
+        self.avgdl = 0.0
+        self.N = 0
+        # inverted index: token_id → np.array([pos, tf, ...])
+        self.token2id: Dict[str, int] = {}
+        self.postings: List[Tuple[np.ndarray, np.ndarray]] = []  # (positions, tfs)
+        self.idf: np.ndarray = None  # per token
 
-def build_view_string(row, view_name):
-    if view_name == 'Name':
-        return str(row.get('name_norm', ''))
-    elif view_name == 'Address':
-        return str(row.get('address_norm', '')) + " " + str(row.get('postal_code', ''))
-    else:
-        return str(row.get('name_norm', '')) + " " + str(row.get('address_norm', '')) + " " + str(row.get('country_norm', ''))
-
-# ---------------------------------------------------------
-# PHASE 3 & 4 (CACHE & CHECKPOINT ENABLED)
-# ---------------------------------------------------------
-def run_kaggle_fast_retrieval():
-    processed_dir = "/kaggle/working/data/processed/train"
-    out_dir = "/kaggle/working/data/retrieval/train"
-    cache_dir = "/kaggle/working/data/cache"
-    os.makedirs(out_dir, exist_ok=True)
-    os.makedirs(cache_dir, exist_ok=True)
-    
-    VIEWS = ['Name', 'Address', 'Full']
-    TOP_K = 30
-    
-    print("⏳ Loading IDs...")
-    s1_df = pd.read_csv(os.path.join(processed_dir, "train_source1_norm.tsv"), sep='\t', usecols=['entity_id'])
-    s1_ids = s1_df['entity_id'].values
-    
-    s2_df = pd.read_csv(os.path.join(processed_dir, "train_source2_norm.tsv"), sep='\t', usecols=['entity_id'])
-    s3_df = pd.read_csv(os.path.join(processed_dir, "train_source3_norm.tsv"), sep='\t', usecols=['entity_id'])
-    candidate_ids = np.concatenate([s2_df['entity_id'].values, s3_df['entity_id'].values])
-    
-    del s1_df, s2_df, s3_df; gc.collect()
-    
-    # Process ONE VIEW AT A TIME to save RAM and checkpoint
-    for view in VIEWS:
-        checkpoint_path = os.path.join(out_dir, f"tfidf_{view.lower()}_top{TOP_K}.parquet")
-        
-        if os.path.exists(checkpoint_path):
-            print(f"✅ Checkpoint found for {view} View. Skipping to next...")
-            continue
-            
-        print(f"\n🚀 --- Processing {view} View ---")
+    def build(self, texts: List[str], doc_ids: np.ndarray):
+        print("  [BM25] Tokenizing and counting term frequencies...")
         t0 = time.time()
-        
-        # Load just the columns needed for this view
-        cols_to_load = ['entity_id']
-        if view == 'Name': cols_to_load += ['name_norm']
-        elif view == 'Address': cols_to_load += ['address_norm', 'postal_code']
-        else: cols_to_load += ['name_norm', 'address_norm', 'country_norm', 'postal_code']
-        
-        s1 = pd.read_csv(os.path.join(processed_dir, "train_source1_norm.tsv"), sep='\t', usecols=cols_to_load).fillna('')
-        s2 = pd.read_csv(os.path.join(processed_dir, "train_source2_norm.tsv"), sep='\t', usecols=cols_to_load).fillna('')
-        s3 = pd.read_csv(os.path.join(processed_dir, "train_source3_norm.tsv"), sep='\t', usecols=cols_to_load).fillna('')
-        
-        print("Creating view strings...")
-        s1_texts = s1.apply(lambda r: build_view_string(r, view), axis=1).tolist()
-        cand_texts = s2.apply(lambda r: build_view_string(r, view), axis=1).tolist() + s3.apply(lambda r: build_view_string(r, view), axis=1).tolist()
-        
-        del s1, s2, s3; gc.collect()
-        
-        print(f"Vectorizing (TF-IDF)...")
-        # Use single characters and words
-        vectorizer = TfidfVectorizer(analyzer='word', stop_words='english', max_features=500000)
-        
-        # Fit and transform candidates
-        cand_matrix = vectorizer.fit_transform(cand_texts)
-        # Transform queries
-        q_matrix = vectorizer.transform(s1_texts)
-        
-        del cand_texts, s1_texts; gc.collect()
-        
-        print(f"✅ Vectorization complete. Query matrix: {q_matrix.shape}, Corpus matrix: {cand_matrix.shape}")
-        
-        print(f"🔍 Searching Top-{TOP_K} via Sparse C++ BLAS (Chunked)...")
-        results_idx, results_scores = get_top_k_sparse(q_matrix, cand_matrix, top_k=TOP_K, batch_size=5000)
-        
-        del q_matrix, cand_matrix, vectorizer; gc.collect()
-        
-        print(f"💾 Saving {view} View Checkpoint...")
-        
-        # Flatten and save
-        n_queries = len(s1_ids)
-        q_ids_rep = np.repeat(s1_ids, TOP_K)
-        c_ids_flat = candidate_ids[results_idx.flatten()]
-        scores_flat = results_scores.flatten()
-        ranks_flat = np.tile(np.arange(1, TOP_K + 1), n_queries)
-        
-        view_df = pd.DataFrame({
-            's1_id': q_ids_rep,
-            'candidate_id': c_ids_flat,
-            'view': view,
-            'rank': ranks_flat,
-            'score': scores_flat
+        self.N = len(texts)
+        self.doc_ids = doc_ids
+
+        # First pass: compute doc lengths and raw term freqs per doc
+        raw_index: Dict[str, List] = defaultdict(list)  # token → [(pos, tf)]
+        doc_lengths = np.zeros(self.N, dtype=np.int32)
+
+        for pos, text in enumerate(texts):
+            tokens = tokenize(text)
+            doc_lengths[pos] = len(tokens)
+            if not tokens: continue
+            # Count TF in this doc
+            counts: Dict[str, int] = {}
+            for t in tokens:
+                counts[t] = counts.get(t, 0) + 1
+            for t, tf in counts.items():
+                raw_index[t].append((pos, tf))
+
+        self.doc_len = doc_lengths
+        self.avgdl = float(doc_lengths.mean()) if self.N > 0 else 1.0
+        print(f"  [BM25] Tokenization done in {time.time()-t0:.1f}s. Vocab before filtering: {len(raw_index):,}")
+
+        # Filter by MIN_DF and cap vocab
+        t1 = time.time()
+        filtered = [(t, postings) for t, postings in raw_index.items() if len(postings) >= MIN_DF]
+        # Sort by df descending to drop least frequent if over MAX_VOCAB
+        filtered.sort(key=lambda x: -len(x[1]))
+        filtered = filtered[:MAX_VOCAB]
+        print(f"  [BM25] Vocab after filtering: {len(filtered):,}  ({time.time()-t1:.1f}s)")
+
+        # Build compact arrays
+        t2 = time.time()
+        idf_values = []
+        for tid, (token, postings_list) in enumerate(filtered):
+            self.token2id[token] = tid
+            df = len(postings_list)
+            # BM25 IDF: log((N - df + 0.5) / (df + 0.5) + 1)
+            idf = math.log((self.N - df + 0.5) / (df + 0.5) + 1.0)
+            idf_values.append(idf)
+            pos_arr = np.array([p for p, _ in postings_list], dtype=np.int32)
+            tf_arr  = np.array([tf for _, tf in postings_list], dtype=np.float32)
+            self.postings.append((pos_arr, tf_arr))
+
+        self.idf = np.array(idf_values, dtype=np.float32)
+        del raw_index, filtered; gc.collect()
+        print(f"  [BM25] Index built in {time.time()-t2:.1f}s. Total build time: {time.time()-t0:.1f}s")
+
+    def query_one(self, text: str, top_k: int = TOP_K) -> Tuple[np.ndarray, np.ndarray]:
+        """Score all candidates matching query tokens. Return top_k (positions, scores)."""
+        tokens = tokenize(text)
+        if not tokens:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.float32)
+
+        # Accumulate scores for matching candidates
+        scores: Dict[int, float] = {}
+        seen_tids = set()
+
+        for token in set(tokens):
+            tid = self.token2id.get(token)
+            if tid is None or tid in seen_tids: continue
+            seen_tids.add(tid)
+
+            idf = float(self.idf[tid])
+            pos_arr, tf_arr = self.postings[tid]
+
+            for i in range(len(pos_arr)):
+                pos = int(pos_arr[i])
+                tf  = float(tf_arr[i])
+                dl  = float(self.doc_len[pos])
+                # BM25 score
+                numerator   = tf * (self.k1 + 1.0)
+                denominator = tf + self.k1 * (1.0 - self.b + self.b * dl / self.avgdl)
+                delta = idf * numerator / denominator
+                scores[pos] = scores.get(pos, 0.0) + delta
+
+        if not scores:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.float32)
+
+        # Fast top-K via argpartition
+        positions = np.array(list(scores.keys()), dtype=np.int32)
+        score_arr = np.array(list(scores.values()), dtype=np.float32)
+
+        if len(score_arr) > top_k:
+            idx = np.argpartition(score_arr, -top_k)[-top_k:]
+            positions, score_arr = positions[idx], score_arr[idx]
+
+        order = np.argsort(-score_arr)
+        return positions[order], score_arr[order]
+
+    def query_batch(self, texts: List[str], top_k: int = TOP_K) -> Tuple[np.ndarray, np.ndarray]:
+        """Query multiple texts, return (n_queries x top_k) arrays."""
+        n = len(texts)
+        all_pos    = np.full((n, top_k), -1, dtype=np.int32)
+        all_scores = np.zeros((n, top_k), dtype=np.float32)
+        for i, text in enumerate(texts):
+            pos, scores = self.query_one(text, top_k)
+            k = len(pos)
+            if k > 0:
+                all_pos[i, :k]    = pos[:k]
+                all_scores[i, :k] = scores[:k]
+        return all_pos, all_scores
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"  [BM25] Index saved to {path}")
+
+    @staticmethod
+    def load(path: str) -> 'BM25Index':
+        with open(path, 'rb') as f:
+            idx = pickle.load(f)
+        print(f"  [BM25] Index loaded from {path}")
+        return idx
+
+# ============================================================
+# PARALLEL QUERY WORKER
+# ============================================================
+def _query_worker(args):
+    """Runs query_batch on a slice of queries. Used by ProcessPoolExecutor."""
+    index_path, texts_slice, top_k = args
+    idx = BM25Index.load(index_path)
+    return idx.query_batch(texts_slice, top_k)
+
+def parallel_query(index_path: str, query_texts: List[str],
+                   top_k: int = TOP_K, num_workers: int = 4) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Distributes query_texts evenly across CPU cores.
+    Each worker loads the cached index independently (avoids pickling large objects).
+    """
+    n = len(query_texts)
+    chunk_size = math.ceil(n / num_workers)
+    chunks = [query_texts[i:i+chunk_size] for i in range(0, n, chunk_size)]
+
+    all_pos    = np.full((n, top_k), -1, dtype=np.int32)
+    all_scores = np.zeros((n, top_k), dtype=np.float32)
+
+    args = [(index_path, chunk, top_k) for chunk in chunks]
+    start = 0
+    with ProcessPoolExecutor(max_workers=num_workers) as pool:
+        for (pos_chunk, score_chunk) in pool.map(_query_worker, args):
+            end = start + pos_chunk.shape[0]
+            all_pos[start:end]    = pos_chunk
+            all_scores[start:end] = score_chunk
+            start = end
+            print(f"    ✅ Worker done  [{end:,}/{n:,}]")
+
+    return all_pos, all_scores
+
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+def load_view_texts(view_cols: List[str]) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
+    """Load S1 query texts and candidate texts for the given view columns."""
+    needed = ["entity_id"] + [c for c in view_cols if c != "entity_id"]
+
+    def safe_read(path):
+        all_cols = pd.read_csv(path, sep='\t', nrows=0).columns.tolist()
+        usecols = [c for c in needed if c in all_cols]
+        return pd.read_csv(path, sep='\t', usecols=usecols, dtype=str).fillna("")
+
+    s1 = safe_read(os.path.join(PROCESSED_DIR, "train_source1_norm.tsv"))
+    s2 = safe_read(os.path.join(PROCESSED_DIR, "train_source2_norm.tsv"))
+    s3 = safe_read(os.path.join(PROCESSED_DIR, "train_source3_norm.tsv"))
+
+    s1_ids = s1["entity_id"].values
+    cand_ids = np.concatenate([s2["entity_id"].values, s3["entity_id"].values])
+
+    s1_texts   = s1.apply(lambda r: build_text(r, view_cols), axis=1).tolist()
+    cand_texts = (pd.concat([s2, s3], ignore_index=True)
+                    .apply(lambda r: build_text(r, view_cols), axis=1)
+                    .tolist())
+
+    del s1, s2, s3; gc.collect()
+    return s1_ids, cand_ids, s1_texts, cand_texts
+
+def run_phase3_4():
+    num_cores = multiprocessing.cpu_count()
+    print(f"🚀 Starting Phase 3 & 4 | {num_cores} CPU cores\n")
+
+    for view_name, view_cols in VIEWS.items():
+        out_path   = os.path.join(OUT_DIR, f"bm25_{view_name}_top{TOP_K}.parquet")
+        idx_path   = os.path.join(CACHE_DIR, f"bm25_{view_name}_index.pkl")
+
+        if os.path.exists(out_path):
+            print(f"⏭️  [{view_name.upper()} VIEW] Checkpoint found — skipping.")
+            continue
+
+        print(f"\n{'='*55}")
+        print(f"  [{view_name.upper()} VIEW]  cols: {view_cols}")
+        print(f"{'='*55}")
+        t_view = time.time()
+
+        # --- Load texts ---
+        print("  Loading texts...")
+        s1_ids, cand_ids, s1_texts, cand_texts = load_view_texts(view_cols)
+        print(f"  Queries: {len(s1_ids):,}  |  Candidates: {len(cand_ids):,}")
+
+        # --- Build / Load Index ---
+        if os.path.exists(idx_path):
+            print("  💾 Loading cached BM25 index...")
+            bm25 = BM25Index.load(idx_path)
+        else:
+            print("  🔨 Building BM25 index on candidate corpus...")
+            bm25 = BM25Index(k1=BM25_K1, b=BM25_B)
+            bm25.build(cand_texts, cand_ids)
+            bm25.save(idx_path)
+
+        del cand_texts; gc.collect()
+
+        # --- Query in Parallel ---
+        print(f"  🔍 Querying Top-{TOP_K} across {num_cores} cores...")
+        t_q = time.time()
+        pos_matrix, score_matrix = parallel_query(idx_path, s1_texts, TOP_K, num_workers=num_cores)
+        print(f"  Querying done in {time.time()-t_q:.1f}s")
+
+        del s1_texts, bm25; gc.collect()
+
+        # --- Flatten & Save ---
+        print("  💾 Saving results as parquet...")
+        n = len(s1_ids)
+        q_ids_rep  = np.repeat(s1_ids, TOP_K)
+        ranks_flat = np.tile(np.arange(1, TOP_K + 1), n)
+        scores_flat = score_matrix.flatten()
+
+        # Map position indices → actual candidate entity_ids
+        flat_pos    = pos_matrix.flatten()
+        valid_mask  = flat_pos >= 0
+        cand_mapped = np.full(len(flat_pos), "", dtype=object)
+        cand_mapped[valid_mask] = cand_ids[flat_pos[valid_mask]]
+
+        df_out = pd.DataFrame({
+            "s1_id":       q_ids_rep,
+            "candidate_id": cand_mapped,
+            "view":        view_name,
+            "rank":        ranks_flat,
+            "score":       scores_flat,
         })
-        
-        # Filter out 0.0 scores (no overlap)
-        view_df = view_df[view_df['score'] > 0]
-        
-        view_df.to_parquet(checkpoint_path, index=False)
-        print(f"✅ {view} View complete in {time.time() - t0:.2f}s.")
-        
-    print("\n🎉 All views processed and checkpointed!")
+        # Drop empty (no-match) rows
+        df_out = df_out[df_out["candidate_id"] != ""].reset_index(drop=True)
+        df_out.to_parquet(out_path, index=False)
+
+        print(f"  ✅ [{view_name.upper()} VIEW] Done | {len(df_out):,} pairs | {time.time()-t_view:.1f}s total")
+        del df_out, q_ids_rep, cand_mapped, pos_matrix, score_matrix; gc.collect()
+
+    print("\n🎉 All views checkpointed. Phase 3 & 4 complete!")
 
 if __name__ == "__main__":
-    run_kaggle_fast_retrieval()
+    run_phase3_4()
