@@ -1,0 +1,42 @@
+--- Inspecting c:/Users/Rutuja Hirudkar/OneDrive/c/amazon ml/student_resource/dataset\train\train_source1.tsv ---
+Columns: ['entity_id', 'business_name', 'business_address', 'country']
+Dtypes:
+entity_id           object
+business_name       object
+business_address    object
+country             object
+dtype: object
+First row:
+{'entity_id': 'S1-925783039', 'business_name': "Orelee's Barbershop", 'business_address': '1795 Westchester Drive, High Point, NC', 'country': 'US'}
+
+--- Inspecting c:/Users/Rutuja Hirudkar/OneDrive/c/amazon ml/student_resource/dataset\train\train_source2.tsv ---
+Columns: ['entity_id', 'business_name', 'business_address', 'country']
+Dtypes:
+entity_id           object
+business_name       object
+business_address    object
+country             object
+dtype: object
+First row:
+{'entity_id': 'S2-166376419', 'business_name': 'राम मार्केटिंग प्राइवेट लिमिटेड', 'business_address': 'KH NO. -570/13, NEW DELHI, WEST DELHI, Delhi', 'country': 'India'}
+
+--- Inspecting c:/Users/Rutuja Hirudkar/OneDrive/c/amazon ml/student_resource/dataset\train\train_source3.tsv ---
+Columns: ['entity_id', 'business_name', 'business_address', 'country']
+Dtypes:
+entity_id           object
+business_name       object
+business_address    object
+country             object
+dtype: object
+First row:
+{'entity_id': 'S3-202863386', 'business_name': 'wilfordhancock.com', 'business_address': 'Mack Rd, Haltom City, Texas', 'country': 'US'}
+
+--- Inspecting c:/Users/Rutuja Hirudkar/OneDrive/c/amazon ml/student_resource/dataset\train\train_ground_truth.tsv ---
+Columns: ['source1_entity_id', 'matched_entity_ids']
+Dtypes:
+source1_entity_id     object
+matched_entity_ids    object
+dtype: object
+First row:
+{'source1_entity_id': 'S1-965667', 'matched_entity_ids': 'S2-681193310,S2-743505751,S3-775321672,S3-11291185,S3-860443364'}
+

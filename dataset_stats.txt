@@ -1,0 +1,82 @@
+--- Stats for c:/Users/Rutuja Hirudkar/OneDrive/c/amazon ml/student_resource/dataset\train\train_source1.tsv ---
+Shape: (2206821, 4)
+Missingness:
+entity_id           0
+business_name       0
+business_address    0
+country             0
+dtype: int64
+Duplicate IDs: 0
+
+--- Stats for c:/Users/Rutuja Hirudkar/OneDrive/c/amazon ml/student_resource/dataset\train\train_source2.tsv ---
+Shape: (5034616, 4)
+Missingness:
+entity_id                0
+business_name            2
+business_address    168967
+country                  0
+dtype: int64
+Duplicate IDs: 0
+
+--- Stats for c:/Users/Rutuja Hirudkar/OneDrive/c/amazon ml/student_resource/dataset\train\train_source3.tsv ---
+Shape: (5285603, 4)
+Missingness:
+entity_id                0
+business_name           13
+business_address    175916
+country                  0
+dtype: int64
+Duplicate IDs: 0
+
+--- Stats for c:/Users/Rutuja Hirudkar/OneDrive/c/amazon ml/student_resource/dataset\train\train_ground_truth.tsv ---
+Shape: (2206821, 2)
+Missingness:
+source1_entity_id          0
+matched_entity_ids    123247
+dtype: int64
+Duplicate IDs: 0
+
+Ground truth total matches: 7638365
+Ground truth match distribution:
+match_count
+3    530841
+4    484115
+2    375212
+5    321957
+6    164868
+0    123247
+1    119157
+7     63968
+8     18680
+9      4205
+Name: count, dtype: int64
+--- Stats for c:/Users/Rutuja Hirudkar/OneDrive/c/amazon ml/student_resource/dataset\test\test_source1.tsv ---
+Shape: (1732544, 4)
+Missingness:
+entity_id           0
+business_name       0
+business_address    0
+country             0
+dtype: int64
+Duplicate IDs: 0
+
+--- Stats for c:/Users/Rutuja Hirudkar/OneDrive/c/amazon ml/student_resource/dataset\test\test_source2.tsv ---
+Shape: (4887273, 4)
+Missingness:
+entity_id                0
+business_name           46
+business_address    129408
+country                  0
+dtype: int64
+Duplicate IDs: 0
+
+--- Stats for c:/Users/Rutuja Hirudkar/OneDrive/c/amazon ml/student_resource/dataset\test\test_source3.tsv ---
+Shape: (5082316, 4)
+Missingness:
+entity_id                0
+business_name           59
+business_address    136098
+country                  0
+dtype: int64
+Duplicate IDs: 0
+

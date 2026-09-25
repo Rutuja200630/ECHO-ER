@@ -1,0 +1,110 @@
+=== Phase 1 Data Normalization Report ===
+
+Processing train_source1.tsv...
+Input Rows: 2206821
+Output Rows: 2206821
+Original Missing Address Count: 0
+address_missing=1 Count: 0
+Postal Codes Extracted: 156066
+Processing Time: 86.89 seconds
+
+Sample:
+  ID: S1-925783039
+  Orig Name: Orelee's Barbershop
+  Norm Name: orelee s barbershop
+  Orig Addr: 1795 Westchester Drive, High Point, NC
+  Norm Addr: 1795 westchester drive, high point, nc
+  Postal Code: nan
+  Addr Missing Flag: 0
+----------------------------------------
+  ID: S1-773889195
+  Orig Name: Prime Money
+  Norm Name: prime money
+  Orig Addr: 17560 Ellis Road, Tahlequah, OK
+  Norm Addr: 17560 ellis road, tahlequah, ok
+  Postal Code: 17560
+  Addr Missing Flag: 0
+----------------------------------------
+  ID: S1-377745466
+  Orig Name: B+ Retail Inc
+  Norm Name: b retail
+  Orig Addr: 1712 Montebello Avenue, Phoenix, AZ
+  Norm Addr: 1712 montebello avenue, phoenix, az
+  Postal Code: nan
+  Addr Missing Flag: 0
+----------------------------------------
+
+========================================
+
+Processing train_source2.tsv...
+Input Rows: 5034616
+Output Rows: 5034616
+Original Missing Address Count: 168967
+address_missing=1 Count: 168967
+Postal Codes Extracted: 402098
+Processing Time: 164.19 seconds
+
+Sample:
+  ID: S2-166376419
+  Orig Name: राम मार्केटिंग प्राइवेट लिमिटेड
+  Norm Name: र म म र क ट ग प र इव ट ल म ट ड
+  Orig Addr: KH NO. -570/13, NEW DELHI, WEST DELHI, Delhi
+  Norm Addr: kh no -570 13, new delhi, west delhi, delhi
+  Postal Code: nan
+  Addr Missing Flag: 0
+----------------------------------------
+  ID: S2-764573417
+  Orig Name: -- Holloway Peak Inc Seafood
+  Norm Name: -- holloway peak inc seafood
+  Orig Addr: 105 ELM ST, MORGANTON, NC
+  Norm Addr: 105 elm street, morganton, nc
+  Postal Code: nan
+  Addr Missing Flag: 0
+----------------------------------------
+  ID: S2-639257739
+  Orig Name: आदित्य प्रॉपर्टीज एलएलपी
+  Norm Name: आद त य प र पर ट ज एलएलप
+  Orig Addr: G-3/571, GULMOHAR COLONY, BHOPAL, Madhya Pradesh
+  Norm Addr: g-3 571, gulmohar colony, bhopal, madhya pradesh
+  Postal Code: nan
+  Addr Missing Flag: 0
+----------------------------------------
+
+========================================
+
+Processing train_source3.tsv...
+Input Rows: 5285603
+Output Rows: 5285603
+Original Missing Address Count: 175916
+address_missing=1 Count: 175916
+Postal Codes Extracted: 419534
+Processing Time: 148.31 seconds
+
+Sample:
+  ID: S3-202863386
+  Orig Name: wilfordhancock.com
+  Norm Name: wilfordhancock com
+  Orig Addr: Mack Rd, Haltom City, Texas
+  Norm Addr: mack road, haltom city, texas
+  Postal Code: nan
+  Addr Missing Flag: 0
+----------------------------------------
+  ID: S3-859268022
+  Orig Name: International South Consultants Private Ltd
+  Norm Name: international south consultants private
+  Orig Addr: nan
+  Norm Addr: nan
+  Postal Code: nan
+  Addr Missing Flag: 1
+----------------------------------------
+  ID: S3-22467283
+  Orig Name: LLC Moncada Léarning Center
+  Norm Name: llc moncada le arning center
+  Orig Addr: 5780 Fawn Ct, Fort Worth, Texas
+  Norm Addr: 5780 fawn ct, fort worth, texas
+  Postal Code: nan
+  Addr Missing Flag: 0
+----------------------------------------
+
+========================================
+
