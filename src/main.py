@@ -138,6 +138,29 @@ def run_phase(phase: str, data_dir: str, output_dir: str, start_row: int = None,
         
     elif phase == "evidence":
         print("Running Evidence Engine...")
+        cand_path = os.path.join(output_dir, 'fused_candidates.tsv')
+        if not os.path.exists(cand_path):
+            print(f"Skipping evidence generation, {cand_path} not found. Did you run --phase retrieval?")
+            return
+            
+        print("Loading Candidates, S1, and S2/S3...", flush=True)
+        df_cands = pd.read_csv(cand_path, sep='\t')
+        df_s1 = pd.read_csv(os.path.join(output_dir, 'feat_train_source1.tsv'), sep='\t', dtype=str)
+        df_s2 = pd.read_csv(os.path.join(output_dir, 'feat_train_source2.tsv'), sep='\t', dtype=str)
+        df_s3 = pd.read_csv(os.path.join(output_dir, 'feat_train_source3.tsv'), sep='\t', dtype=str)
+        df_corpus = pd.concat([df_s2, df_s3], ignore_index=True)
+        
+        print("Building Information Value (IDF) Dictionary...", flush=True)
+        from evidence import build_idf_dict, generate_evidence_dataset
+        # Build IDF dictionary from the corpus normalized names
+        idf_dict = build_idf_dict(df_corpus['norm_name'])
+        
+        print("Calculating Pairwise Evidence Features...", flush=True)
+        df_evidence = generate_evidence_dataset(df_cands, df_s1, df_corpus, idf_dict)
+        
+        out_path = os.path.join(output_dir, 'evidence_features.tsv')
+        print(f"Saving {len(df_evidence)} pairwise features to {out_path}...", flush=True)
+        df_evidence.to_csv(out_path, sep='\t', index=False)
         print("Evidence generation complete.")
         
     elif phase == "train":

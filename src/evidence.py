@@ -109,3 +109,55 @@ def build_idf_dict(corpus_series: pd.Series) -> Dict[str, float]:
             
     idf_dict = {t: math.log(N / (df + 1)) for t, df in doc_freqs.items()}
     return idf_dict
+
+def generate_evidence_dataset(candidates_df: pd.DataFrame, s1_df: pd.DataFrame, s2_s3_df: pd.DataFrame, idf_dict: Dict[str, float] = None) -> pd.DataFrame:
+    """
+    Takes a dataframe of (s1_id, s2_id) candidates, merges the full records from s1 and s2_s3,
+    and calculates all pairwise evidence features.
+    """
+    print("Merging candidate pairs with source data...")
+    # Select only necessary columns to save memory
+    needed_cols = ['entity_id', 'norm_name', 'norm_address', 'norm_country', 'fp_address_numbers']
+    s1_sub = s1_df[[c for c in needed_cols if c in s1_df.columns]].set_index('entity_id')
+    s2_s3_sub = s2_s3_df[[c for c in needed_cols if c in s2_s3_df.columns]].set_index('entity_id')
+    
+    # We will iterate row by row since we have complex dictionary-based logic
+    # To speed this up, we convert the sub dataframes to dicts
+    print("Converting data to dictionary lookup...")
+    s1_dict = s1_sub.to_dict('index')
+    s2_dict = s2_s3_sub.to_dict('index')
+    
+    records = []
+    
+    # Try importing tqdm for progress bar
+    try:
+        from tqdm import tqdm
+        iterator = tqdm(candidates_df.itertuples(index=False), total=len(candidates_df), desc="Calculating Evidence")
+    except ImportError:
+        iterator = candidates_df.itertuples(index=False)
+        
+    for row in iterator:
+        s1_id = row.s1_id
+        s2_id = row.s2_id
+        
+        # Get raw records
+        rec1 = s1_dict.get(s1_id, {})
+        rec2 = s2_dict.get(s2_id, {})
+        
+        # Calculate features
+        feats = calculate_pairwise_evidence(rec1, rec2, idf_dict)
+        
+        # Add identifiers and retrieval scores
+        feats['s1_id'] = s1_id
+        feats['s2_id'] = s2_id
+        if hasattr(row, 'rrf_score'):
+            feats['rrf_score'] = row.rrf_score
+        if hasattr(row, 'score'):
+            feats['retrieval_score'] = row.score
+        if hasattr(row, 'fused_rank'):
+            feats['rank'] = row.fused_rank
+            
+        records.append(feats)
+        
+    print("Converting features to DataFrame...")
+    return pd.DataFrame(records)
