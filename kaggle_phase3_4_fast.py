@@ -133,25 +133,42 @@ class BM25Index:
         if not tokens:
             return np.array([], dtype=np.int32), np.array([], dtype=np.float32)
 
-        scores: Dict[int, float] = {}
+        # Use numpy arrays for accumulation instead of pure Python dict
+        # We accumulate into a compact dict but compute per-token scores vectorized
+        pos_list: List[np.ndarray] = []
+        contrib_list: List[np.ndarray] = []
+
         for token in set(tokens):
             tid = self.token2id.get(token)
             if tid is None: continue
             idf = float(self.idf[tid])
             pos_arr, tf_arr = self.postings[tid]
-            for i in range(len(pos_arr)):
-                pos = int(pos_arr[i])
-                tf  = float(tf_arr[i])
-                dl  = float(self.doc_len[pos])
-                num = tf * (self.k1 + 1.0)
-                den = tf + self.k1 * (1.0 - self.b + self.b * dl / self.avgdl)
-                scores[pos] = scores.get(pos, 0.0) + idf * num / den
 
-        if not scores:
+            # --- VECTORIZED BM25 scoring (replaces Python for loop) ---
+            dl_arr = self.doc_len[pos_arr].astype(np.float32)
+            num = tf_arr * (self.k1 + 1.0)
+            den = tf_arr + self.k1 * (1.0 - self.b + self.b * dl_arr / self.avgdl)
+            contrib = idf * num / den  # shape: (len(posting_list),)
+            pos_list.append(pos_arr)
+            contrib_list.append(contrib)
+
+        if not pos_list:
             return np.array([], dtype=np.int32), np.array([], dtype=np.float32)
 
-        positions  = np.fromiter(scores.keys(),   dtype=np.int32,   count=len(scores))
-        score_arr  = np.fromiter(scores.values(), dtype=np.float32, count=len(scores))
+        # Merge all token contributions into one array, then group-sum by position
+        all_pos    = np.concatenate(pos_list)
+        all_contrib = np.concatenate(contrib_list)
+
+        # Group-sum: sort by position, then use np.add.reduceat
+        order      = np.argsort(all_pos, kind='stable')
+        sorted_pos = all_pos[order]
+        sorted_val = all_contrib[order]
+
+        unique_pos, first_occ = np.unique(sorted_pos, return_index=True)
+        summed_scores = np.add.reduceat(sorted_val, first_occ)
+
+        positions = unique_pos.astype(np.int32)
+        score_arr = summed_scores.astype(np.float32)
 
         if len(score_arr) > TOP_K:
             idx = np.argpartition(score_arr, -TOP_K)[-TOP_K:]
