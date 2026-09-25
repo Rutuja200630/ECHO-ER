@@ -91,8 +91,12 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_co
     query_ids = queries_df[q_id_col].tolist()
     num_queries = len(query_texts)
     num_corpus = retriever.matrix.shape[0]
+    import time
     
     for start_q in range(0, num_queries, batch_size):
+        if start_q % (batch_size * 5) == 0:
+            print(f"  -> Processing query {start_q}/{num_queries} ({(start_q/num_queries)*100:.1f}%)", flush=True)
+            
         end_q = min(start_q + batch_size, num_queries)
         batch_texts = query_texts[start_q:end_q]
         batch_ids = query_ids[start_q:end_q]
@@ -153,6 +157,10 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_co
                     global_top_scores[i, :len(valid_scores)] = valid_scores
                     global_top_indices[i, :len(valid_indices)] = valid_indices
                     
+            # Free chunk matrices immediately
+            del scores_mat
+            del corpus_chunk_mat
+                    
         # Format results for this query batch
         for i in range(curr_batch_size):
             q_id = batch_ids[i]
@@ -175,6 +183,13 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_co
                         "rank": rank,
                         "score": score
                     })
+                    
+        # Explicit memory cleanup
+        del q_vecs
+        del global_top_scores
+        del global_top_indices
+        import gc
+        gc.collect()
                     
     return pd.DataFrame(all_results)
             
