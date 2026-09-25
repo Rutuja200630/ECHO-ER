@@ -28,16 +28,32 @@ import pyarrow.parquet as pq
 # ============================================================
 # CONFIG
 # ============================================================
-TOP_K        = 30
-BM25_K1      = 1.5
-BM25_B       = 0.75
-MAX_VOCAB    = 300_000
-MIN_DF       = 2
-CHUNK_WRITE  = 50_000      # write results every N queries
+TOP_K             = 30
+BM25_K1           = 1.5
+BM25_B            = 0.75
+MAX_VOCAB         = 300_000
+MIN_DF            = 2
+MAX_POSTING_LIST  = 80_000   # CRITICAL: skip tokens matched by >80k docs (they are noise)
+CHUNK_WRITE       = 50_000   # write results every N queries
 
 CACHE_DIR     = "/kaggle/working/cache"
 OUT_DIR       = "/kaggle/working/retrieval"
 PROCESSED_DIR = "/kaggle/working/data/processed/train"
+
+# English + common business stop words to skip entirely at query time
+STOP_WORDS = {
+    'the','a','an','and','or','of','in','on','at','to','for','is','are','was',
+    'be','by','as','it','its','this','that','with','from','have','has','had',
+    'not','but','they','we','you','our','your','their',
+    # Common address tokens (too generic)
+    'street','road','avenue','boulevard','drive','lane','way','place','court',
+    'st','rd','ave','blvd','dr','ln','pl','ct','suite','floor','unit','apt',
+    # Common business tokens
+    'services','service','group','company','management','international','national',
+    'general','center','centre','enterprises','solutions','technology',
+    # Common country/region tokens
+    'north','south','east','west','new','old',
+}
 
 VIEWS = {
     "name":    ["name_norm"],
@@ -139,10 +155,17 @@ class BM25Index:
         contrib_list: List[np.ndarray] = []
 
         for token in set(tokens):
+            # Skip generic stop words — match too many docs, add zero signal
+            if token in STOP_WORDS:
+                continue
             tid = self.token2id.get(token)
             if tid is None: continue
             idf = float(self.idf[tid])
             pos_arr, tf_arr = self.postings[tid]
+
+            # Skip ultra-high-frequency tokens (effectively corpus stop words)
+            if len(pos_arr) > MAX_POSTING_LIST:
+                continue
 
             # --- VECTORIZED BM25 scoring (replaces Python for loop) ---
             dl_arr = self.doc_len[pos_arr].astype(np.float32)
@@ -151,6 +174,7 @@ class BM25Index:
             contrib = idf * num / den  # shape: (len(posting_list),)
             pos_list.append(pos_arr)
             contrib_list.append(contrib)
+
 
         if not pos_list:
             return np.array([], dtype=np.int32), np.array([], dtype=np.float32)
