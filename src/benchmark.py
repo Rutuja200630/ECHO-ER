@@ -1,15 +1,16 @@
 import os
+import sys
 import time
 import tracemalloc
 import pandas as pd
+import argparse
 from retrieval import SparseRetriever, batch_retrieve, create_views
 
-def benchmark(n_queries=10000, n_corpus=100000):
+def benchmark(data_dir, n_queries=10000, n_corpus=100000):
     print(f"=== BENCHMARK: Queries={n_queries}, Corpus={n_corpus} ===")
-    data_dir = r"c:\Users\Rutuja Hirudkar\OneDrive\c\amazon ml\student_resource\dataset\train"
     
     # We will use the raw TSVs and just apply a quick normalization view 
-    print("Loading datasets...")
+    print(f"Loading datasets from {data_dir}...")
     df_s1 = pd.read_csv(os.path.join(data_dir, "train_source1.tsv"), sep="\t", dtype=str, nrows=n_queries)
     
     # We need n_corpus from S2/S3
@@ -105,4 +106,8 @@ def benchmark(n_queries=10000, n_corpus=100000):
     print("Done.")
 
 if __name__ == "__main__":
-    benchmark(10000, 100000)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=str, required=True, help="Path to dataset")
+    args = parser.parse_args()
+    
+    benchmark(args.data_dir, 10000, 100000)
