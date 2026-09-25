@@ -374,11 +374,22 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_co
             # Massive parallel sparse dot product on GPU
             scores_mat_gpu = q_vecs_gpu.dot(corpus_gpu_T)
             
+            # DEBUG: Print shapes and non-zeros
+            if start_q == 0:
+                print("\n--- DEBUG INFO (First Batch) ---")
+                print(f"q_vecs_cpu: shape={q_vecs_cpu.shape}, nnz={q_vecs_cpu.nnz}, dtype={q_vecs_cpu.dtype}")
+                print(f"q_vecs_gpu: shape={q_vecs_gpu.shape}, nnz={q_vecs_gpu.nnz}, dtype={q_vecs_gpu.dtype}")
+                print(f"corpus_gpu_T: shape={corpus_gpu_T.shape}, nnz={corpus_gpu_T.nnz}, dtype={corpus_gpu_T.dtype}")
+                print(f"scores_mat_gpu: shape={scores_mat_gpu.shape}, nnz={scores_mat_gpu.nnz}, dtype={scores_mat_gpu.dtype}")
+            
             # We want Top-K. We can convert back to CPU to use fast_topk, or just use CuPy
-            # CuPy argsort on dense matrix is fast if batch isn't too huge, but scores_mat_gpu is SPARSE.
-            # Fast way: Bring the sparse results back to CPU and use our C++ fast_topk module!
             scores_mat_cpu = scores_mat_gpu.get() # Transmits only non-zero sparse matrix elements back to CPU
             
+            if start_q == 0:
+                print(f"scores_mat_cpu: shape={scores_mat_cpu.shape}, nnz={scores_mat_cpu.nnz}, dtype={scores_mat_cpu.dtype}")
+                print(f"scores_mat_cpu indptr type: {scores_mat_cpu.indptr.dtype}, indices type: {scores_mat_cpu.indices.dtype}")
+                print("--------------------------------\n")
+                
             # Clean up GPU memory for this batch
             del q_vecs_gpu
             del scores_mat_gpu
@@ -399,6 +410,8 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_co
                     global_top_indices
                 )
             except Exception as e:
+                if start_q == 0:
+                    print(f"WARNING: fast_topk failed or not found ({e}). Falling back to python loop.")
                 # Python fallback if fast_topk is missing or throws type error
                 for i in range(curr_batch_size):
                     row_start = scores_mat_cpu.indptr[i]
@@ -415,6 +428,10 @@ def batch_retrieve(queries_df: pd.DataFrame, retriever, q_id_col: str, q_text_co
                     else:
                         global_top_scores[i, :len(row_data)] = row_data
                         global_top_indices[i, :len(row_cols)] = row_cols
+            
+            if start_q == 0:
+                valid_count = (global_top_indices != -1).sum()
+                print(f"DEBUG: First batch generated {valid_count} valid candidate indices.")
                 
             # Format results for this query batch
             for i in range(curr_batch_size):

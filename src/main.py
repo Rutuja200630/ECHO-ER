@@ -120,6 +120,12 @@ def run_phase(phase: str, data_dir: str, output_dir: str, start_row: int = None,
             
         print("Fusing candidates with Reciprocal Rank Fusion (RRF)...")
         if candidate_dfs:
+            print(f"DEBUG: Preparing to fuse {len(candidate_dfs)} candidate DataFrames.")
+            for i, df_c in enumerate(candidate_dfs):
+                print(f"DEBUG: df_{i} length: {len(df_c)}")
+                if not df_c.empty:
+                    print(f"DEBUG: df_{i} head:\n{df_c.head(2)}")
+            
             fused_candidates = reciprocal_rank_fusion(candidate_dfs)
             
             suffix = ""
